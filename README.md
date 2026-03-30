@@ -9,7 +9,6 @@ The notebook covers environment setup, inference with Qwen3-4B-Thinking (INT8), 
 | File | Description |
 |---|---|
 | `starter_code_cse151b_comp.ipynb` | Main entry point |
-| `requirements.txt` | Python dependencies (installed via `uv`) |
 | `judger.py` | Response scoring logic |
 | `utils.py` | Utilities used by `judger.py` |
 | `data/public.jsonl` | Public dataset with ground-truth answers |
