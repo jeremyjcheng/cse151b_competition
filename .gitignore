@@ -1,6 +1,6 @@
-.claude
-.venv
-results
+.venv/
+.ipynb_checkpoints/
+results/
+__pycache__/
+*.json
 data
-__pycache__
-LICENSE
