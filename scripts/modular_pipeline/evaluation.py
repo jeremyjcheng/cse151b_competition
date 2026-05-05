@@ -1,6 +1,36 @@
 """Judger-based evaluation helpers."""
 
+import signal
+
 from tqdm import tqdm
+
+
+class _JudgeTimeout(Exception):
+    """Raised when a single judger call exceeds the time budget."""
+
+
+def _alarm_handler(signum, frame):
+    del signum, frame
+    raise _JudgeTimeout()
+
+
+def _safe_auto_judge(judger, pred: str, gold: list, options_per_slot: list, timeout_s: float = 2.0) -> bool:
+    """Run `judger.auto_judge` with a per-item timeout and safe fallback."""
+    if "\\boxed" not in pred:
+        # Most malformed outputs without a final boxed answer are low quality and
+        # can trigger expensive parsing paths in symbolic equivalence checks.
+        return False
+
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    try:
+        signal.signal(signal.SIGALRM, _alarm_handler)
+        signal.setitimer(signal.ITIMER_REAL, timeout_s)
+        return bool(judger.auto_judge(pred=pred, gold=gold, options=options_per_slot))
+    except (_JudgeTimeout, Exception):
+        return False
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        signal.signal(signal.SIGALRM, previous_handler)
 
 
 def evaluate_with_judger(data: list[dict], records_by_id: dict) -> None:
@@ -11,7 +41,11 @@ def evaluate_with_judger(data: list[dict], records_by_id: dict) -> None:
         print(f"Could not import Judger for evaluation: {exc}")
         return
 
-    judger = Judger(strict_extract=False)
+    try:
+        judger = Judger(strict_extract=False)
+    except Exception as exc:
+        print(f"Could not initialize Judger for evaluation: {exc}")
+        return
 
     mcq_total = mcq_correct = 0
     free_total = free_correct = 0
@@ -29,10 +63,12 @@ def evaluate_with_judger(data: list[dict], records_by_id: dict) -> None:
         gold = answer if isinstance(answer, list) else [answer]
         options_per_slot = [item.get("options", [])] * len(gold)
 
-        try:
-            ok = bool(judger.auto_judge(pred=pred, gold=gold, options=options_per_slot))
-        except Exception:
-            ok = False
+        ok = _safe_auto_judge(
+            judger,
+            pred=pred,
+            gold=gold,
+            options_per_slot=options_per_slot,
+        )
 
         if item.get("options"):
             mcq_total += 1
