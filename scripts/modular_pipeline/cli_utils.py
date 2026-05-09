@@ -3,6 +3,21 @@
 import argparse
 from pathlib import Path
 
+from settings import (
+    GRAD_ACCUM_STEPS,
+    LEARNING_RATE,
+    LORA_ALPHA,
+    LORA_DROPOUT,
+    LORA_R,
+    LORA_TARGET_MODULES,
+    MAX_SEQ_LEN,
+    MAX_STEPS,
+    SAVE_EVERY_STEPS,
+    TRAIN_BATCH_SIZE,
+    WARMUP_RATIO,
+    WEIGHT_DECAY,
+)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -33,6 +48,14 @@ def parse_args() -> argparse.Namespace:
         help="CUDA_VISIBLE_DEVICES value passed through to the pipeline.",
     )
     parser.add_argument(
+        "--lora-adapter-path",
+        default=None,
+        help=(
+            "Optional local path to a trained LoRA adapter directory. "
+            "If provided, adapter weights are loaded on top of the base model."
+        ),
+    )
+    parser.add_argument(
         "--limit-mcq",
         type=int,
         default=None,
@@ -55,6 +78,214 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Seed for the random subset selection used by --limit-mcq / --limit-free.",
+    )
+    parser.add_argument(
+        "--save-raw-output",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "If enabled (default), persist full raw model generations in JSONL "
+            "outputs under the `raw` field. Disable with --no-save-raw-output."
+        ),
+    )
+    return parser.parse_args()
+
+
+def parse_train_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="LoRA fine-tuning with a custom PyTorch loop.",
+    )
+    parser.add_argument(
+        "--stage",
+        choices=("reasoning", "adapt"),
+        default="adapt",
+        help=(
+            "Training stage. `reasoning` trains on public reasoning datasets; "
+            "`adapt` lightly adapts formatting on competition data."
+        ),
+    )
+    parser.add_argument(
+        "--input",
+        default="public",
+        help=(
+            "'public' (default), 'private', or a path to a .jsonl file with "
+            "optional `answer` fields used as supervision targets."
+        ),
+    )
+    parser.add_argument(
+        "--output-dir",
+        required=True,
+        help="Directory where LoRA adapter checkpoints and final adapter are saved.",
+    )
+    parser.add_argument(
+        "--gpu-id",
+        default="0",
+        help="CUDA_VISIBLE_DEVICES value passed through to training.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=TRAIN_BATCH_SIZE,
+        help=f"Per-step micro-batch size. Default: {TRAIN_BATCH_SIZE}.",
+    )
+    parser.add_argument(
+        "--grad-accum-steps",
+        type=int,
+        default=GRAD_ACCUM_STEPS,
+        help=f"Gradient accumulation steps. Default: {GRAD_ACCUM_STEPS}.",
+    )
+    parser.add_argument(
+        "--learning-rate",
+        type=float,
+        default=LEARNING_RATE,
+        help=f"Optimizer learning rate. Default: {LEARNING_RATE}.",
+    )
+    parser.add_argument(
+        "--weight-decay",
+        type=float,
+        default=WEIGHT_DECAY,
+        help=f"Optimizer weight decay. Default: {WEIGHT_DECAY}.",
+    )
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=MAX_STEPS,
+        help=f"Maximum optimizer steps. Default: {MAX_STEPS}.",
+    )
+    parser.add_argument(
+        "--warmup-ratio",
+        type=float,
+        default=WARMUP_RATIO,
+        help=f"Warmup ratio for scheduler. Default: {WARMUP_RATIO}.",
+    )
+    parser.add_argument(
+        "--max-seq-length",
+        "--max-seq-len",
+        dest="max_seq_len",
+        type=int,
+        default=MAX_SEQ_LEN,
+        help=f"Training sequence length cap. Default: {MAX_SEQ_LEN}.",
+    )
+    parser.add_argument(
+        "--save-every-steps",
+        type=int,
+        default=SAVE_EVERY_STEPS,
+        help=f"Checkpoint save interval. Default: {SAVE_EVERY_STEPS}.",
+    )
+    parser.add_argument(
+        "--lora-r",
+        type=int,
+        default=LORA_R,
+        help=f"LoRA rank. Default: {LORA_R}.",
+    )
+    parser.add_argument(
+        "--lora-alpha",
+        type=int,
+        default=LORA_ALPHA,
+        help=f"LoRA alpha. Default: {LORA_ALPHA}.",
+    )
+    parser.add_argument(
+        "--lora-dropout",
+        type=float,
+        default=LORA_DROPOUT,
+        help=f"LoRA dropout. Default: {LORA_DROPOUT}.",
+    )
+    parser.add_argument(
+        "--lora-target-modules",
+        nargs="+",
+        default=list(LORA_TARGET_MODULES),
+        help=(
+            "One or more module names to target with LoRA adapters. "
+            f"Default: {' '.join(LORA_TARGET_MODULES)}"
+        ),
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Random seed for data order and reproducibility.",
+    )
+    parser.add_argument(
+        "--limit-mcq",
+        type=int,
+        default=None,
+        help="Optional cap for MCQ examples during training.",
+    )
+    parser.add_argument(
+        "--limit-free",
+        type=int,
+        default=None,
+        help="Optional cap for free-form examples during training.",
+    )
+    parser.add_argument(
+        "--sample-seed",
+        type=int,
+        default=0,
+        help="Seed for subset selection when limits are enabled.",
+    )
+    parser.add_argument(
+        "--include-openmath",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Include unsloth/OpenMathReasoning-mini in stage `reasoning` "
+            "(opt-in)."
+        ),
+    )
+    parser.add_argument(
+        "--include-hendrycks",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Include EleutherAI/hendrycks_math in stage `reasoning` (opt-in).",
+    )
+    parser.add_argument(
+        "--max-openmath-examples",
+        type=int,
+        default=None,
+        help="Optional cap for OpenMath examples in stage `reasoning`.",
+    )
+    parser.add_argument(
+        "--max-hendrycks-examples",
+        type=int,
+        default=None,
+        help="Optional cap for Hendrycks examples in stage `reasoning`.",
+    )
+    parser.add_argument(
+        "--hendrycks-configs",
+        nargs="+",
+        default=[
+            "algebra",
+            "counting_and_probability",
+            "geometry",
+            "intermediate_algebra",
+            "number_theory",
+            "prealgebra",
+            "precalculus",
+        ],
+        help=(
+            "Hendrycks subject configs to load when --include-hendrycks is set."
+        ),
+    )
+    parser.add_argument(
+        "--train-on-full-chat",
+        action="store_true",
+        help=(
+            "If set, train on all assistant tokens in the completion. "
+            "By default only the final boxed target is supervised."
+        ),
+    )
+    parser.add_argument(
+        "--resume-from-adapter",
+        default=None,
+        help=(
+            "Optional adapter directory to resume from before current stage "
+            "training (typically Stage 2 adaption from Stage 1 adapter)."
+        ),
+    )
+    parser.add_argument(
+        "--save-final-merged",
+        action="store_true",
+        help="If set, also save a merged full model checkpoint (large).",
     )
     return parser.parse_args()
 

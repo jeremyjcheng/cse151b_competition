@@ -3,6 +3,32 @@
 import re
 
 
+def _find_boxed_spans(text: str) -> list[tuple[int, int]]:
+    """Return [start, end) spans for every brace-balanced \\boxed{...}."""
+    spans: list[tuple[int, int]] = []
+    i = 0
+    while True:
+        start = text.find("\\boxed{", i)
+        if start < 0:
+            break
+        brace_start = start + len("\\boxed{")
+        depth = 1
+        j = brace_start
+        while j < len(text) and depth > 0:
+            ch = text[j]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+            j += 1
+        if depth == 0:
+            spans.append((start, j))
+            i = j
+        else:
+            break
+    return spans
+
+
 def extract_all_boxed(text: str) -> list[str]:
     """Brace-balanced extraction of every \\boxed{...} occurrence."""
     out: list[str] = []
@@ -37,6 +63,9 @@ def extract_boxed(text: str) -> str:
 def clean_special_tokens(text: str) -> str:
     text = text.replace("<|im_end|>", "")
     text = text.replace("<|endoftext|>", "")
+    text = re.sub(r"<\|[^|>]+\|>", "", text)
+    text = text.replace("<think>", "")
+    text = text.replace("</think>", "")
     return text.strip()
 
 
@@ -99,6 +128,29 @@ def _last_answer_phrase(text: str) -> str:
     return nums[-1] if nums else ""
 
 
+def canonicalize_mcq_response(response: str, letter: str) -> str:
+    """Keep rationale text while enforcing exactly one final \\boxed{X}."""
+    normalized_letter = str(letter).strip().upper()
+    if not normalized_letter:
+        return response
+
+    spans = _find_boxed_spans(response)
+    if not spans:
+        body = response.rstrip()
+    else:
+        chunks: list[str] = []
+        cursor = 0
+        for start, end in spans:
+            chunks.append(response[cursor:start])
+            cursor = end
+        chunks.append(response[cursor:])
+        body = "".join(chunks).rstrip()
+
+    if body:
+        return body + f"\n\n\\boxed{{{normalized_letter}}}"
+    return f"\\boxed{{{normalized_letter}}}"
+
+
 def ensure_boxed(response: str) -> str:
     """Guarantee the response contains a final \\boxed{...} for the judger."""
     if extract_all_boxed(response):
@@ -115,3 +167,41 @@ def ensure_boxed(response: str) -> str:
     if fallback:
         return response.rstrip() + f"\n\n\\boxed{{{fallback}}}"
     return response.rstrip() + "\n\n\\boxed{}"
+
+
+def truncate_after_first_boxed(response: str) -> str:
+    """Drop trailing text after first complete \\boxed{...} span."""
+    spans = _find_boxed_spans(response)
+    if not spans:
+        return response
+    first_end = spans[0][1]
+    return response[:first_end].rstrip()
+
+
+def truncate_after_last_boxed(response: str) -> str:
+    """Drop trailing text after the last complete \\boxed{...} span."""
+    spans = _find_boxed_spans(response)
+    if not spans:
+        return response
+    last_end = spans[-1][1]
+    return response[:last_end].rstrip()
+
+
+def canonicalize_free_response(response: str) -> str:
+    """Preserve rationale but force exactly one final boxed answer."""
+    ensured = ensure_boxed(response)
+    final_value = extract_boxed(ensured).strip()
+    spans = _find_boxed_spans(ensured)
+    if spans:
+        chunks: list[str] = []
+        cursor = 0
+        for start, end in spans:
+            chunks.append(ensured[cursor:start])
+            cursor = end
+        chunks.append(ensured[cursor:])
+        body = "".join(chunks).rstrip()
+    else:
+        body = ensured.rstrip()
+    if body:
+        return body + f"\n\n\\boxed{{{final_value}}}"
+    return f"\\boxed{{{final_value}}}"

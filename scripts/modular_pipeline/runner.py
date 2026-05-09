@@ -23,7 +23,13 @@ def _discover_project_root(start: Path) -> Path:
     return start.parent
 
 
-def _write_records(file_obj, chunk: list[dict], solved_batch: list[dict]) -> None:
+def _write_records(
+    file_obj,
+    chunk: list[dict],
+    solved_batch: list[dict],
+    *,
+    save_raw_output: bool = True,
+) -> None:
     for item, solved in zip(chunk, solved_batch):
         rec = {
             "id": item.get("id"),
@@ -31,6 +37,8 @@ def _write_records(file_obj, chunk: list[dict], solved_batch: list[dict]) -> Non
             "response": solved["response"],
             "meta": solved["meta"],
         }
+        if save_raw_output:
+            rec["raw"] = solved.get("raw")
         file_obj.write(json.dumps(rec) + "\n")
 
     file_obj.flush()
@@ -110,7 +118,7 @@ def main() -> None:
     print(f"Remaining questions to solve: {len(remaining_data)}")
 
     if remaining_data:
-        pipe = ModularPipeline(gpu_id=args.gpu_id)
+        pipe = ModularPipeline(gpu_id=args.gpu_id, lora_adapter_path=args.lora_adapter_path)
         mcq_items = [item for item in remaining_data if item.get("options")]
         free_items = [item for item in remaining_data if not item.get("options")]
 
@@ -121,12 +129,22 @@ def main() -> None:
             for start in tqdm(range(0, len(mcq_items), MCQ_BATCH_SIZE), desc="Solving MCQ batches"):
                 chunk = mcq_items[start : start + MCQ_BATCH_SIZE]
                 solved_batch = pipe.solve_mcq_batch(chunk)
-                _write_records(f, chunk, solved_batch)
+                _write_records(
+                    f,
+                    chunk,
+                    solved_batch,
+                    save_raw_output=args.save_raw_output,
+                )
 
             for start in tqdm(range(0, len(free_items), FREE_BATCH_SIZE), desc="Solving free-form batches"):
                 chunk = free_items[start : start + FREE_BATCH_SIZE]
                 solved_batch = pipe.solve_free_batch(chunk)
-                _write_records(f, chunk, solved_batch)
+                _write_records(
+                    f,
+                    chunk,
+                    solved_batch,
+                    save_raw_output=args.save_raw_output,
+                )
 
         print(f"Saved incremental outputs to {output_path.resolve()}")
     else:

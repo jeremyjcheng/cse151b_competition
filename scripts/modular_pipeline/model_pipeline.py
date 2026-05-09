@@ -24,7 +24,13 @@ from settings import (
     TOP_P_FREE,
     TOP_P_MCQ,
 )
-from text_processing import clean_special_tokens, ensure_boxed, extract_boxed, extract_valid_letter
+from text_processing import (
+    canonicalize_free_response,
+    clean_special_tokens,
+    ensure_boxed,
+    extract_boxed,
+    extract_valid_letter,
+)
 
 
 class BatchBudgetForcingProcessor(LogitsProcessor):
@@ -51,7 +57,12 @@ class BatchBudgetForcingProcessor(LogitsProcessor):
 
 
 class ModularPipeline:
-    def __init__(self, gpu_id: str = "0", model_id: str = MODEL_ID):
+    def __init__(
+        self,
+        gpu_id: str = "0",
+        model_id: str = MODEL_ID,
+        lora_adapter_path: str | None = None,
+    ):
         os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
 
         self.model_id = model_id
@@ -72,6 +83,15 @@ class ModularPipeline:
             quantization_config=bnb_config,
             device_map="auto",
         )
+        if lora_adapter_path:
+            try:
+                from peft import PeftModel
+            except Exception as exc:
+                raise RuntimeError(
+                    "LoRA adapter path was provided, but PEFT is unavailable. "
+                    "Install `peft` to load adapters."
+                ) from exc
+            self.llm = PeftModel.from_pretrained(self.llm, lora_adapter_path)
 
         eot_ids = self.tokenizer.encode("</think>", add_special_tokens=False)
         if len(eot_ids) == 1:
@@ -207,15 +227,17 @@ class ModularPipeline:
             primary_raws.append(raw)
 
             if letter:
-                if extract_boxed(raw).strip().upper() != letter:
-                    raw = raw.rstrip() + f"\n\n\\boxed{{{letter}}}"
+                response = ensure_boxed(f"\\boxed{{{letter}}}")
                 solved[idx] = {
-                    "response": raw,
+                    "response": response,
                     "raw": raw,
                     "meta": {
                         "is_mcq": True,
+                        "output_type": "mcq",
                         "n_tokens": out["n_tokens"],
-                        "boxed": letter,
+                        "boxed": extract_boxed(response),
+                        "cleaned_response": response,
+                        "raw_was_truncated": response != raw,
                         "finalizer_used": False,
                         "option_match_used": False,
                     },
@@ -272,18 +294,41 @@ class ModularPipeline:
                         option_match_used = True
 
                 if not letter:
-                    letter = labels[0]
+                    raw = primary_raws[original_idx]
+                    response = ensure_boxed(raw)
+                    solved[original_idx] = {
+                        "response": response,
+                        "raw": raw,
+                        "meta": {
+                            "is_mcq": True,
+                            "output_type": "mcq",
+                            "n_tokens": primary_outputs[original_idx]["n_tokens"] + fout["n_tokens"],
+                            "boxed": extract_boxed(response),
+                            "cleaned_response": response,
+                            "raw_was_truncated": response != raw,
+                            "finalizer_used": True,
+                            "option_match_used": option_match_used,
+                            "malformed_output": True,
+                            "malformed_reason": "no_valid_mcq_letter",
+                        },
+                    }
+                    continue
 
-                raw = primary_raws[original_idx].rstrip() + f"\n\n\\boxed{{{letter}}}"
+                raw = primary_raws[original_idx]
+                response = ensure_boxed(f"\\boxed{{{letter}}}")
                 solved[original_idx] = {
-                    "response": raw,
+                    "response": response,
                     "raw": raw,
                     "meta": {
                         "is_mcq": True,
+                        "output_type": "mcq",
                         "n_tokens": primary_outputs[original_idx]["n_tokens"] + fout["n_tokens"],
-                        "boxed": letter,
+                        "boxed": extract_boxed(response),
+                        "cleaned_response": response,
+                        "raw_was_truncated": response != raw,
                         "finalizer_used": True,
                         "option_match_used": option_match_used,
+                        "malformed_output": False,
                     },
                 }
 
@@ -310,15 +355,18 @@ class ModularPipeline:
         solved: list[dict] = []
         for out in outputs:
             raw = out["raw"]
-            response = ensure_boxed(raw)
+            response = canonicalize_free_response(raw)
             solved.append(
                 {
                     "response": response,
                     "raw": raw,
                     "meta": {
                         "is_mcq": False,
+                        "output_type": "free",
                         "n_tokens": out["n_tokens"],
                         "boxed": extract_boxed(response),
+                        "cleaned_response": response,
+                        "raw_was_truncated": response != raw,
                         "boxed_fallback_used": response != raw,
                     },
                 }
