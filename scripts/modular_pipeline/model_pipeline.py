@@ -1,18 +1,27 @@
 """Model loading and batched solving logic."""
 
 import os
+import re
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, LogitsProcessor
 
 from prompting import build_free_user, build_mcq_user
 from settings import (
+    FINAL_ANSWER_CUE_WINDOW_CHARS,
     MAX_TOKENS_FREE,
     MAX_TOKENS_MCQ,
     MAX_TOKENS_MCQ_FINAL,
+    MIN_TOKENS_BEFORE_BOXED_STOP,
     MODEL_ID,
+    NO_REPEAT_NGRAM_SIZE_FREE,
+    NO_REPEAT_NGRAM_SIZE_MCQ,
+    NO_REPEAT_NGRAM_SIZE_MCQ_FINAL,
+    POST_BOX_PATIENCE_TOKENS_FREE,
+    POST_BOX_PATIENCE_TOKENS_MCQ,
     REP_PEN_FREE,
     REP_PEN_MCQ,
+    REP_PEN_MCQ_FINAL,
     SYSTEM_PROMPT_FREE,
     SYSTEM_PROMPT_MCQ,
     TEMP_FREE,
@@ -25,11 +34,18 @@ from settings import (
     TOP_P_MCQ,
 )
 from text_processing import (
-    canonicalize_free_response,
+    canonicalize_free_response_with_meta,
     clean_special_tokens,
-    ensure_boxed,
+    extract_all_boxed,
     extract_boxed,
-    extract_valid_letter,
+    extract_first_valid_letter,
+    iter_boxed_spans,
+    mcq_canonical_response,
+)
+
+_FINAL_CUE_RE = re.compile(
+    r"(?:final\s+answer|therefore|thus|hence)\b",
+    re.IGNORECASE,
 )
 
 
@@ -53,6 +69,103 @@ class BatchBudgetForcingProcessor(LogitsProcessor):
             if self.end_think_token_id not in row_tokens:
                 scores[row_idx, :] = float("-inf")
                 scores[row_idx, self.end_think_token_id] = 0.0
+        return scores
+
+
+class SmartBoxedStopProcessor(LogitsProcessor):
+    """Force EOS after a likely-final \\boxed{{...}}, not the first intermediate span."""
+
+    def __init__(
+        self,
+        tokenizer,
+        input_width: int,
+        eos_token_id: int,
+        *,
+        min_tokens_before_stop: int,
+        post_box_patience_tokens: int,
+        cue_window_chars: int,
+        mcq_valid_per_row: list[set[str]] | None,
+    ):
+        self.tokenizer = tokenizer
+        self.input_width = input_width
+        self.eos_token_id = eos_token_id
+        self.min_tokens_before_stop = min_tokens_before_stop
+        self.post_box_patience_tokens = post_box_patience_tokens
+        self.cue_window_chars = cue_window_chars
+        self.mcq_valid_per_row = mcq_valid_per_row
+
+    def _should_force_eos_free(self, partial_clean: str, spans: list[tuple[int, int, str]]) -> bool:
+        start, end, _value = spans[-1]
+        after = partial_clean[end:]
+        after_ids = self.tokenizer.encode(after, add_special_tokens=False)
+        if len(after_ids) > self.post_box_patience_tokens:
+            return True
+        if not after.strip():
+            return True
+        ctx_start = max(0, start - self.cue_window_chars)
+        context = partial_clean[ctx_start:start]
+        if _FINAL_CUE_RE.search(context):
+            return True
+        return False
+
+    def _should_force_eos_mcq(self, row_idx: int, partial_clean: str, spans: list[tuple[int, int, str]]) -> bool:
+        valid_set = self.mcq_valid_per_row[row_idx] if self.mcq_valid_per_row else set()
+
+        first_valid_end: int | None = None
+        for start, end, val in spans:
+            inner = val.strip().upper()
+            if inner in valid_set:
+                first_valid_end = end
+                break
+
+        if first_valid_end is not None:
+            after = partial_clean[first_valid_end:]
+            after_ids = self.tokenizer.encode(after, add_special_tokens=False)
+            if len(after_ids) > self.post_box_patience_tokens:
+                return True
+            if not after.strip():
+                return True
+            if self.post_box_patience_tokens == 0 and len(after_ids) > 0:
+                return True
+            return False
+
+        start, end, _value = spans[-1]
+        after = partial_clean[end:]
+        after_ids = self.tokenizer.encode(after, add_special_tokens=False)
+        if len(after_ids) > self.post_box_patience_tokens:
+            return True
+        if not after.strip():
+            return True
+        ctx_start = max(0, start - self.cue_window_chars)
+        context = partial_clean[ctx_start:start]
+        if _FINAL_CUE_RE.search(context):
+            return True
+        return False
+
+    def __call__(self, input_ids, scores):
+        for row_idx in range(input_ids.shape[0]):
+            row_tokens = input_ids[row_idx, self.input_width :]
+            if row_tokens.numel() == 0:
+                continue
+
+            n_generated = int(row_tokens.shape[0])
+            if n_generated < self.min_tokens_before_stop:
+                continue
+
+            partial = self.tokenizer.decode(row_tokens, skip_special_tokens=False)
+            partial_clean = clean_special_tokens(partial)
+            spans = iter_boxed_spans(partial_clean)
+            if not spans:
+                continue
+
+            if self.mcq_valid_per_row is not None:
+                ok = self._should_force_eos_mcq(row_idx, partial_clean, spans)
+            else:
+                ok = self._should_force_eos_free(partial_clean, spans)
+
+            if ok:
+                scores[row_idx, :] = float("-inf")
+                scores[row_idx, self.eos_token_id] = 0.0
         return scores
 
 
@@ -154,6 +267,10 @@ class ModularPipeline:
         repetition_penalty: float,
         do_sample: bool,
         think_budget: int,
+        force_smart_boxed_stop: bool = False,
+        mcq_valid_per_row: list[set[str]] | None = None,
+        post_box_patience_tokens: int = POST_BOX_PATIENCE_TOKENS_FREE,
+        no_repeat_ngram_size: int = 0,
     ) -> list[dict]:
         chats = [self._make_chat(system, user) for system, user in zip(system_prompts, user_prompts)]
         inputs = self.tokenizer(
@@ -172,6 +289,18 @@ class ModularPipeline:
                 input_width=input_width,
             )
         ]
+        if force_smart_boxed_stop:
+            logits_processors.append(
+                SmartBoxedStopProcessor(
+                    tokenizer=self.tokenizer,
+                    input_width=input_width,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    min_tokens_before_stop=MIN_TOKENS_BEFORE_BOXED_STOP,
+                    post_box_patience_tokens=post_box_patience_tokens,
+                    cue_window_chars=FINAL_ANSWER_CUE_WINDOW_CHARS,
+                    mcq_valid_per_row=mcq_valid_per_row,
+                )
+            )
 
         gen_kwargs = {
             **inputs,
@@ -184,6 +313,8 @@ class ModularPipeline:
         }
         if do_sample:
             gen_kwargs.update({"temperature": temperature, "top_p": top_p, "top_k": top_k})
+        if no_repeat_ngram_size and no_repeat_ngram_size > 0:
+            gen_kwargs["no_repeat_ngram_size"] = no_repeat_ngram_size
 
         with torch.no_grad():
             output_ids = self.llm.generate(**gen_kwargs)
@@ -196,12 +327,48 @@ class ModularPipeline:
             results.append({"raw": raw, "n_tokens": int(new_tokens.shape[0])})
         return results
 
+    @staticmethod
+    def _mcq_build_meta(
+        *,
+        primary_raw: str,
+        response: str,
+        n_tokens: int,
+        finalizer_used: bool,
+        option_match_used: bool,
+        extractor_path: str,
+        fallback_used: bool,
+        malformed: bool,
+        malformed_reason: str,
+        finalizer_n_tokens: int = 0,
+        boxed_in_raw: list[str],
+    ) -> dict:
+        return {
+            "is_mcq": True,
+            "output_type": "mcq",
+            "raw": primary_raw,
+            "n_tokens": n_tokens + finalizer_n_tokens,
+            "boxed": extract_boxed(response),
+            "cleaned_response": response,
+            "raw_was_truncated": response != primary_raw,
+            "finalizer_used": finalizer_used,
+            "option_match_used": option_match_used,
+            "extractor_path": extractor_path,
+            "fallback_used": fallback_used,
+            "malformed_output": malformed,
+            "malformed_reason": malformed_reason,
+            "boxed_count_in_raw": len(boxed_in_raw),
+            "stop_policy": "smart_boxed",
+        }
+
     def solve_mcq_batch(self, items: list[dict]) -> list[dict]:
         if not items:
             return []
 
         user_prompts = [build_mcq_user(item["question"], item["options"]) for item in items]
         system_prompts = [SYSTEM_PROMPT_MCQ] * len(items)
+        mcq_valid = [
+            {chr(65 + j) for j in range(len(item["options"]))} for item in items
+        ]
 
         primary_outputs = self._generate_batch(
             system_prompts,
@@ -213,6 +380,10 @@ class ModularPipeline:
             repetition_penalty=REP_PEN_MCQ,
             do_sample=False,
             think_budget=THINK_BUDGET_MCQ,
+            force_smart_boxed_stop=True,
+            mcq_valid_per_row=mcq_valid,
+            post_box_patience_tokens=POST_BOX_PATIENCE_TOKENS_MCQ,
+            no_repeat_ngram_size=NO_REPEAT_NGRAM_SIZE_MCQ,
         )
 
         solved = [None] * len(items)
@@ -223,24 +394,27 @@ class ModularPipeline:
         for idx, (item, out) in enumerate(zip(items, primary_outputs)):
             raw = out["raw"]
             labels = [chr(65 + i) for i in range(len(item["options"]))]
-            letter = extract_valid_letter(raw, labels)
+            letter = extract_first_valid_letter(raw, labels)
             primary_raws.append(raw)
+            boxed_in_raw = extract_all_boxed(raw)
 
             if letter:
-                response = ensure_boxed(f"\\boxed{{{letter}}}")
+                response = mcq_canonical_response(letter)
                 solved[idx] = {
                     "response": response,
                     "raw": raw,
-                    "meta": {
-                        "is_mcq": True,
-                        "output_type": "mcq",
-                        "n_tokens": out["n_tokens"],
-                        "boxed": extract_boxed(response),
-                        "cleaned_response": response,
-                        "raw_was_truncated": response != raw,
-                        "finalizer_used": False,
-                        "option_match_used": False,
-                    },
+                    "meta": self._mcq_build_meta(
+                        primary_raw=raw,
+                        response=response,
+                        n_tokens=out["n_tokens"],
+                        finalizer_used=False,
+                        option_match_used=False,
+                        extractor_path="mcq_first_valid_letter",
+                        fallback_used=False,
+                        malformed=False,
+                        malformed_reason="",
+                        boxed_in_raw=boxed_in_raw,
+                    ),
                 }
             else:
                 finalizer_items.append(item)
@@ -269,6 +443,10 @@ class ModularPipeline:
                     "Output ONLY \\boxed{X}."
                 )
 
+            fin_valid = [
+                {chr(65 + j) for j in range(len(item["options"]))} for item in finalizer_items
+            ]
+
             finalizer_outputs = self._generate_batch(
                 finalizer_system_prompts,
                 finalizer_user_prompts,
@@ -276,60 +454,68 @@ class ModularPipeline:
                 temperature=0.0,
                 top_p=1.0,
                 top_k=0,
-                repetition_penalty=1.0,
+                repetition_penalty=REP_PEN_MCQ_FINAL,
                 do_sample=False,
                 think_budget=0,
+                force_smart_boxed_stop=True,
+                mcq_valid_per_row=fin_valid,
+                post_box_patience_tokens=POST_BOX_PATIENCE_TOKENS_MCQ,
+                no_repeat_ngram_size=NO_REPEAT_NGRAM_SIZE_MCQ_FINAL,
             )
 
             for original_idx, fout in zip(finalizer_indices, finalizer_outputs):
                 item = items[original_idx]
                 labels = [chr(65 + i) for i in range(len(item["options"]))]
-                letter = extract_valid_letter(fout["raw"], labels)
+                letter = extract_first_valid_letter(fout["raw"], labels)
                 option_match_used = False
+                raw = primary_raws[original_idx]
+                boxed_in_raw = extract_all_boxed(raw)
 
                 if not letter:
-                    matched = self._option_match_letter(primary_raws[original_idx], item["options"], labels)
+                    matched = self._option_match_letter(raw, item["options"], labels)
                     if matched:
                         letter = matched
                         option_match_used = True
 
                 if not letter:
-                    raw = primary_raws[original_idx]
-                    response = ensure_boxed(raw)
+                    response = mcq_canonical_response("")
                     solved[original_idx] = {
                         "response": response,
                         "raw": raw,
-                        "meta": {
-                            "is_mcq": True,
-                            "output_type": "mcq",
-                            "n_tokens": primary_outputs[original_idx]["n_tokens"] + fout["n_tokens"],
-                            "boxed": extract_boxed(response),
-                            "cleaned_response": response,
-                            "raw_was_truncated": response != raw,
-                            "finalizer_used": True,
-                            "option_match_used": option_match_used,
-                            "malformed_output": True,
-                            "malformed_reason": "no_valid_mcq_letter",
-                        },
+                        "meta": self._mcq_build_meta(
+                            primary_raw=raw,
+                            response=response,
+                            n_tokens=primary_outputs[original_idx]["n_tokens"] + fout["n_tokens"],
+                            finalizer_used=True,
+                            option_match_used=option_match_used,
+                            extractor_path="none",
+                            fallback_used=True,
+                            malformed=True,
+                            malformed_reason="no_valid_mcq_letter",
+                            finalizer_n_tokens=fout["n_tokens"],
+                            boxed_in_raw=boxed_in_raw,
+                        ),
                     }
                     continue
 
-                raw = primary_raws[original_idx]
-                response = ensure_boxed(f"\\boxed{{{letter}}}")
+                response = mcq_canonical_response(letter)
+                path = "mcq_finalizer_letter" if not option_match_used else "mcq_option_match_judger"
                 solved[original_idx] = {
                     "response": response,
                     "raw": raw,
-                    "meta": {
-                        "is_mcq": True,
-                        "output_type": "mcq",
-                        "n_tokens": primary_outputs[original_idx]["n_tokens"] + fout["n_tokens"],
-                        "boxed": extract_boxed(response),
-                        "cleaned_response": response,
-                        "raw_was_truncated": response != raw,
-                        "finalizer_used": True,
-                        "option_match_used": option_match_used,
-                        "malformed_output": False,
-                    },
+                    "meta": self._mcq_build_meta(
+                        primary_raw=raw,
+                        response=response,
+                        n_tokens=primary_outputs[original_idx]["n_tokens"] + fout["n_tokens"],
+                        finalizer_used=True,
+                        option_match_used=option_match_used,
+                        extractor_path=path,
+                        fallback_used=False,
+                        malformed=False,
+                        malformed_reason="",
+                        finalizer_n_tokens=fout["n_tokens"],
+                        boxed_in_raw=boxed_in_raw,
+                    ),
                 }
 
         return solved
@@ -350,12 +536,17 @@ class ModularPipeline:
             repetition_penalty=REP_PEN_FREE,
             do_sample=True,
             think_budget=THINK_BUDGET_FREE,
+            force_smart_boxed_stop=True,
+            mcq_valid_per_row=None,
+            post_box_patience_tokens=POST_BOX_PATIENCE_TOKENS_FREE,
+            no_repeat_ngram_size=NO_REPEAT_NGRAM_SIZE_FREE,
         )
 
         solved: list[dict] = []
         for out in outputs:
             raw = out["raw"]
-            response = canonicalize_free_response(raw)
+            response, extract_meta = canonicalize_free_response_with_meta(raw)
+            boxed_in_raw = extract_meta.get("boxed_candidates") or extract_all_boxed(raw)
             solved.append(
                 {
                     "response": response,
@@ -363,11 +554,19 @@ class ModularPipeline:
                     "meta": {
                         "is_mcq": False,
                         "output_type": "free",
+                        "raw": raw,
                         "n_tokens": out["n_tokens"],
                         "boxed": extract_boxed(response),
                         "cleaned_response": response,
-                        "raw_was_truncated": response != raw,
-                        "boxed_fallback_used": response != raw,
+                        "raw_was_truncated": response.strip() != raw.strip(),
+                        "boxed_fallback_used": bool(extract_meta.get("fallback_used")),
+                        "extractor_path": extract_meta.get("extractor_path", "free"),
+                        "boxed_count_in_raw": extract_meta.get("boxed_count_in_raw", len(boxed_in_raw)),
+                        "selected_boxed_index": extract_meta.get("selected_boxed_index"),
+                        "cue_matched": extract_meta.get("cue_matched", False),
+                        "malformed_output": extract_meta.get("malformed_output", False),
+                        "malformed_reason": extract_meta.get("malformed_reason", ""),
+                        "stop_policy": "smart_boxed",
                     },
                 }
             )

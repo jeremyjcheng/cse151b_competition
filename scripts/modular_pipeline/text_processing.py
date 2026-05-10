@@ -29,6 +29,41 @@ def _find_boxed_spans(text: str) -> list[tuple[int, int]]:
     return spans
 
 
+def iter_boxed_spans(text: str) -> list[tuple[int, int, str]]:
+    """Brace-balanced \\boxed{{...}} spans: (start, end, inner_text)."""
+    return _find_boxed_with_values(text)
+
+
+def _find_boxed_with_values(text: str) -> list[tuple[int, int, str]]:
+    """Return [start, end, inner_value] for every complete \\boxed{...}."""
+    out: list[tuple[int, int, str]] = []
+    i = 0
+    while True:
+        start = text.find("\\boxed{", i)
+        if start < 0:
+            break
+        brace_start = start + len("\\boxed{")
+        depth = 1
+        j = brace_start
+        while j < len(text) and depth > 0:
+            ch = text[j]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+            j += 1
+        if depth == 0:
+            out.append((start, j, text[brace_start : j - 1].strip()))
+            i = j
+        else:
+            break
+    return out
+
+
+def has_complete_boxed(text: str) -> bool:
+    return bool(_find_boxed_spans(text))
+
+
 def extract_all_boxed(text: str) -> list[str]:
     """Brace-balanced extraction of every \\boxed{...} occurrence."""
     out: list[str] = []
@@ -69,13 +104,42 @@ def clean_special_tokens(text: str) -> str:
     return text.strip()
 
 
-def extract_valid_letter(text: str, labels: list[str]) -> str:
-    valid_set = set(labels)
-    upper = text.upper()
+_LATEX_SINGLE_LETTER_WRAP = re.compile(
+    r"\\(?:text|mathrm|mathbf|mathit|textbf|textit|emph|mbox)\s*\{\s*([A-Za-z])\s*\}",
+    re.IGNORECASE,
+)
 
-    boxed = extract_boxed(upper).strip().upper()
-    if boxed in valid_set:
-        return boxed
+
+def _mcq_letter_from_boxed_inner(inner: str, valid_set_upper: set[str]) -> str:
+    """Map \\boxed{{inner}} to one option letter (handles \\text{{J}}, nested wrappers)."""
+    if not inner or not valid_set_upper:
+        return ""
+
+    s = inner.strip().strip(".$)'\"")
+    for _ in range(8):
+        if len(s) == 1 and s.upper() in valid_set_upper:
+            return s.upper()
+        m = _LATEX_SINGLE_LETTER_WRAP.search(s)
+        if not m:
+            break
+        s = m.group(1).strip().strip(".$)'\"")
+    if len(s) == 1 and s.upper() in valid_set_upper:
+        return s.upper()
+    return ""
+
+
+def extract_valid_letter(text: str, labels: list[str]) -> str:
+    valid_set_upper = {str(x).strip().upper() for x in labels}
+    if not valid_set_upper:
+        return ""
+
+    inner_last = extract_boxed(text)
+    if inner_last:
+        cand = _mcq_letter_from_boxed_inner(inner_last, valid_set_upper)
+        if cand:
+            return cand
+
+    upper = text.upper()
 
     patterns = [
         r"\\BOXED\{\s*([A-Z])\s*\}",
@@ -90,9 +154,38 @@ def extract_valid_letter(text: str, labels: list[str]) -> str:
     for pattern in patterns:
         matches = re.findall(pattern, upper)
         for match in reversed(matches):
-            if match in valid_set:
+            if match in valid_set_upper:
                 return match
 
+    return ""
+
+
+def extract_first_valid_letter(text: str, labels: list[str]) -> str:
+    """Extract the first valid MCQ letter, prioritizing boxed options."""
+    valid_set_upper = {str(x).strip().upper() for x in labels}
+    if not valid_set_upper:
+        return ""
+
+    for _, _, boxed_value in _find_boxed_with_values(text):
+        cand = _mcq_letter_from_boxed_inner(boxed_value, valid_set_upper)
+        if cand:
+            return cand
+
+    upper = text.upper()
+
+    patterns = [
+        r"\\BOXED\{\s*([A-Z])\s*\}",
+        r"OPTION\s+([A-Z])",
+        r"CHOICE\s+([A-Z])",
+        r"ANSWER\s+IS\s+([A-Z])",
+        r"FINAL\s+ANSWER\s+IS\s+([A-Z])",
+        r"CORRESPONDS\s+TO\s+OPTION\s+([A-Z])",
+        r"MATCH(?:ES)?\s+OPTION\s+([A-Z])",
+    ]
+    for pattern in patterns:
+        for match in re.findall(pattern, upper):
+            if match in valid_set_upper:
+                return match
     return ""
 
 
@@ -187,21 +280,61 @@ def truncate_after_last_boxed(response: str) -> str:
     return response[:last_end].rstrip()
 
 
+_FINAL_ANSWER_CUE_PATTERN = re.compile(
+    r"(?:final\s+answer|therefore|thus|hence)\b",
+    re.IGNORECASE,
+)
+
+
 def canonicalize_free_response(response: str) -> str:
-    """Preserve rationale but force exactly one final boxed answer."""
+    """Return exactly one boxed free-response answer using cue-aware selection."""
+    out, _meta = canonicalize_free_response_with_meta(response)
+    return out
+
+
+def canonicalize_free_response_with_meta(response: str) -> tuple[str, dict]:
+    """Return canonical single \\boxed{...} plus extractor diagnostics for FRQ."""
     ensured = ensure_boxed(response)
-    final_value = extract_boxed(ensured).strip()
-    spans = _find_boxed_spans(ensured)
-    if spans:
-        chunks: list[str] = []
-        cursor = 0
-        for start, end in spans:
-            chunks.append(ensured[cursor:start])
-            cursor = end
-        chunks.append(ensured[cursor:])
-        body = "".join(chunks).rstrip()
-    else:
-        body = ensured.rstrip()
-    if body:
-        return body + f"\n\n\\boxed{{{final_value}}}"
-    return f"\\boxed{{{final_value}}}"
+    boxed = _find_boxed_with_values(ensured)
+    boxed_inners = [b[2].strip() for b in boxed]
+    meta: dict = {
+        "extractor_path": "free",
+        "boxed_count_in_raw": len(boxed),
+        "boxed_candidates": boxed_inners,
+        "selected_boxed_index": None,
+        "cue_matched": False,
+        "fallback_used": False,
+        "malformed_output": False,
+        "malformed_reason": "",
+    }
+
+    if not boxed:
+        meta["fallback_used"] = True
+        meta["malformed_output"] = True
+        meta["malformed_reason"] = "no_boxed_after_ensure"
+        return ensure_boxed("\\boxed{}"), meta
+
+    cue_pattern = _FINAL_ANSWER_CUE_PATTERN
+    selected_value = boxed[-1][2].strip()
+    selected_index = len(boxed) - 1
+    meta["selected_boxed_index"] = selected_index
+
+    for actual_idx in range(len(boxed) - 1, -1, -1):
+        start, _end, value = boxed[actual_idx]
+        context_start = max(0, start - 180)
+        context = ensured[context_start:start]
+        if cue_pattern.search(context):
+            selected_value = value.strip()
+            selected_index = actual_idx
+            meta["cue_matched"] = True
+            meta["selected_boxed_index"] = selected_index
+            break
+
+    meta["extractor_path"] = "free_cue_last" if meta["cue_matched"] else "free_last_boxed"
+    return f"\\boxed{{{selected_value}}}", meta
+
+
+def mcq_canonical_response(letter: str) -> str:
+    """Single MCQ submission line: exactly \\boxed{X}."""
+    ch = str(letter).strip().upper()
+    return f"\\boxed{{{ch}}}" if ch else "\\boxed{}"

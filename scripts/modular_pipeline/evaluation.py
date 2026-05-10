@@ -77,6 +77,9 @@ def evaluate_with_judger(data: list[dict], records_by_id: dict) -> None:
     malformed_multi_box = 0
     malformed_invalid_mcq = 0
     format_valid_total = 0
+    raw_multi_box = 0
+    malformed_flag_meta = 0
+    extractor_counts: dict[str, int] = {}
 
     for item in tqdm(data, desc="Scoring with Judger"):
         answer = item.get("answer")
@@ -88,11 +91,26 @@ def evaluate_with_judger(data: list[dict], records_by_id: dict) -> None:
             continue
 
         pred = rec.get("response", "")
+        meta = rec.get("meta") or {}
         boxed_values = extract_all_boxed(pred)
         if not boxed_values:
             malformed_missing_box += 1
         if len(boxed_values) > 1:
             malformed_multi_box += 1
+
+        n_in_raw = meta.get("boxed_count_in_raw")
+        if n_in_raw is None:
+            raw_text = rec.get("raw") or ""
+            n_in_raw = len(extract_all_boxed(raw_text))
+        if n_in_raw > 1:
+            raw_multi_box += 1
+
+        if meta.get("malformed_output"):
+            malformed_flag_meta += 1
+
+        ep = str(meta.get("extractor_path") or "")
+        if ep:
+            extractor_counts[ep] = extractor_counts.get(ep, 0) + 1
 
         gold = answer if isinstance(answer, list) else [answer]
         options_per_slot = [item.get("options", [])] * len(gold)
@@ -143,4 +161,12 @@ def evaluate_with_judger(data: list[dict], records_by_id: dict) -> None:
         f"  Malformed  : missing_box={malformed_missing_box}, "
         f"multiple_box={malformed_multi_box}, invalid_mcq_letter={malformed_invalid_mcq}"
     )
+    print(
+        f"  Diagnostics: raw_multi_boxed_spans={raw_multi_box}, "
+        f"meta_malformed_flag={malformed_flag_meta}"
+    )
+    if extractor_counts:
+        top_paths = sorted(extractor_counts.items(), key=lambda x: -x[1])[:12]
+        paths_str = ", ".join(f"{k}={v}" for k, v in top_paths)
+        print(f"  Extractor paths (top): {paths_str}")
     print("=" * 50)
