@@ -95,6 +95,32 @@ def extract_boxed(text: str) -> str:
     return matches[-1] if matches else ""
 
 
+def visible_answer_after_think_tags(text: str) -> str:
+    """Return text after the last explicit think/reasoning closing delimiter, if any.
+
+    Some templates wrap chain-of-thought; the final \\boxed{{...}} is often after
+    the closing tag, so phrase regexes work better on that slice.
+    """
+    if not text:
+        return text
+    markers = (
+        "</think>",
+        "</redacted_reasoning>",
+    )
+    best_pos = -1
+    best_len = 0
+    for m in markers:
+        pos = text.rfind(m)
+        if pos > best_pos:
+            best_pos = pos
+            best_len = len(m)
+        elif pos == best_pos and pos >= 0 and len(m) > best_len:
+            best_len = len(m)
+    if best_pos < 0:
+        return text
+    return text[best_pos + best_len :].strip()
+
+
 def clean_special_tokens(text: str) -> str:
     text = text.replace("<|im_end|>", "")
     text = text.replace("<|endoftext|>", "")
@@ -133,9 +159,9 @@ def extract_valid_letter(text: str, labels: list[str]) -> str:
     if not valid_set_upper:
         return ""
 
-    inner_last = extract_boxed(text)
-    if inner_last:
-        cand = _mcq_letter_from_boxed_inner(inner_last, valid_set_upper)
+    # Last *valid* letter among all \\boxed{{...}}, not only the last box (avoids \\boxed{{}} tail).
+    for _start, _end, inner in reversed(iter_boxed_spans(text)):
+        cand = _mcq_letter_from_boxed_inner(inner, valid_set_upper)
         if cand:
             return cand
 
@@ -145,10 +171,18 @@ def extract_valid_letter(text: str, labels: list[str]) -> str:
         r"\\BOXED\{\s*([A-Z])\s*\}",
         r"OPTION\s+([A-Z])",
         r"CHOICE\s+([A-Z])",
-        r"ANSWER\s+IS\s+([A-Z])",
+        r"CORRECT\s+ANSWER\s+IS\s+([A-Z])",
+        r"CORRECT\s+CHOICE\s+IS\s+([A-Z])",
+        r"THE\s+ANSWER\s+IS\s+([A-Z])",
+        r"ANSWER\s+IS\s+(?:OPTION\s+)?([A-Z])",
+        r"CHOICE\s+IS\s+([A-Z])",
+        r"OPTION\s+IS\s+([A-Z])",
         r"FINAL\s+ANSWER\s+IS\s+([A-Z])",
         r"CORRESPONDS\s+TO\s+OPTION\s+([A-Z])",
         r"MATCH(?:ES)?\s+OPTION\s+([A-Z])",
+        r"(?:SELECT|PICK|CHOOSE)\s+(?:OPTION\s+)?([A-Z])\b",
+        r"\bTHEREFORE[,:]?\s+(?:OPTION\s+)?([A-Z])\b",
+        r"\bHENCE[,:]?\s+(?:OPTION\s+)?([A-Z])\b",
     ]
 
     for pattern in patterns:
@@ -177,15 +211,55 @@ def extract_first_valid_letter(text: str, labels: list[str]) -> str:
         r"\\BOXED\{\s*([A-Z])\s*\}",
         r"OPTION\s+([A-Z])",
         r"CHOICE\s+([A-Z])",
-        r"ANSWER\s+IS\s+([A-Z])",
+        r"CORRECT\s+ANSWER\s+IS\s+([A-Z])",
+        r"CORRECT\s+CHOICE\s+IS\s+([A-Z])",
+        r"THE\s+ANSWER\s+IS\s+([A-Z])",
+        r"ANSWER\s+IS\s+(?:OPTION\s+)?([A-Z])",
+        r"CHOICE\s+IS\s+([A-Z])",
+        r"OPTION\s+IS\s+([A-Z])",
         r"FINAL\s+ANSWER\s+IS\s+([A-Z])",
         r"CORRESPONDS\s+TO\s+OPTION\s+([A-Z])",
         r"MATCH(?:ES)?\s+OPTION\s+([A-Z])",
+        r"(?:SELECT|PICK|CHOOSE)\s+(?:OPTION\s+)?([A-Z])\b",
+        r"\bTHEREFORE[,:]?\s+(?:OPTION\s+)?([A-Z])\b",
+        r"\bHENCE[,:]?\s+(?:OPTION\s+)?([A-Z])\b",
     ]
     for pattern in patterns:
         for match in re.findall(pattern, upper):
             if match in valid_set_upper:
                 return match
+    return ""
+
+
+def extract_tail_mcq_letter(text: str, labels: list[str]) -> str:
+    """Extract a likely final MCQ letter from answer-style phrases near the end."""
+    valid_set_upper = {str(x).strip().upper() for x in labels}
+    if not valid_set_upper:
+        return ""
+
+    tail = text[-2000:]
+    upper = tail.upper()
+
+    patterns = [
+        r"(?:FINAL\s+ANSWER|ANSWER|ANS)\s*(?:IS|=|:)?\s*[\(\[]?\s*([A-Z])\s*[\)\]]?",
+        r"(?:OPTION|CHOICE)\s*(?:IS|=|:)?\s*[\(\[]?\s*([A-Z])\s*[\)\]]?",
+        r"(?:I\s+CHOOSE|MY\s+CHOICE\s+IS)\s*[\(\[]?\s*([A-Z])\s*[\)\]]?",
+    ]
+
+    for pattern in patterns:
+        matches = re.findall(pattern, upper, flags=re.IGNORECASE)
+        for match in reversed(matches):
+            ch = str(match).strip().upper()
+            if ch in valid_set_upper:
+                return ch
+
+    # Last resort in tail: standalone single-letter answer line.
+    line_matches = re.findall(r"^\s*[\(\[]?\s*([A-Z])\s*[\)\]]?\s*$", upper, flags=re.MULTILINE)
+    for match in reversed(line_matches):
+        ch = str(match).strip().upper()
+        if ch in valid_set_upper:
+            return ch
+
     return ""
 
 

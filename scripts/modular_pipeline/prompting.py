@@ -13,9 +13,9 @@ def build_mcq_user(question: str, options: list[str]) -> str:
         f"Q: {question}\n\n"
         f"Options:\n{opts_text}\n\n"
         f"Valid choices: [{valid_letters}].\n"
-        "Compute the answer first, compare it to the options, "
-        "then output exactly one final answer as \\boxed{X}. "
-        "Do not repeat \\boxed{...}. Stop immediately after the final boxed answer."
+        "Choose the single best option and output exactly one final line as \\boxed{X}, "
+        "where X is one valid choice letter. If uncertain, output your best guess from "
+        "valid choices. Do not include explanation text, and do not output multiple boxed answers."
     )
 
 

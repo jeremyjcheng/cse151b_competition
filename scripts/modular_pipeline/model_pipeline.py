@@ -1,13 +1,19 @@
-"""Model loading and batched solving logic."""
+"""Model loading and batched solving logic.
+
+Inference backend is vLLM instead of HuggingFace generate + LogitsProcessor.
+The pipeline keeps prompting and answer extraction mostly unchanged, but adds
+safer MCQ extraction and stronger finalizer recovery.
+"""
 
 import os
 import re
+from typing import Any
 
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, LogitsProcessor
+from transformers import AutoTokenizer
 
 from prompting import build_free_user, build_mcq_user
 from settings import (
+    ENABLE_THINKING_MCQ_PRIMARY,
     FINAL_ANSWER_CUE_WINDOW_CHARS,
     MAX_TOKENS_FREE,
     MAX_TOKENS_MCQ,
@@ -26,147 +32,60 @@ from settings import (
     SYSTEM_PROMPT_MCQ,
     TEMP_FREE,
     TEMP_MCQ,
-    THINK_BUDGET_FREE,
-    THINK_BUDGET_MCQ,
     TOP_K_FREE,
     TOP_K_MCQ,
     TOP_P_FREE,
     TOP_P_MCQ,
+    VLLM_GPU_MEMORY_UTILIZATION,
+    VLLM_LOAD_FORMAT,
+    VLLM_MAX_MODEL_LEN,
+    VLLM_MAX_NUM_BATCHED_TOKENS,
+    VLLM_MAX_NUM_SEQS,
+    VLLM_QUANTIZATION,
 )
 from text_processing import (
     canonicalize_free_response_with_meta,
     clean_special_tokens,
-    extract_all_boxed,
     extract_boxed,
-    extract_first_valid_letter,
+    extract_all_boxed,
+    extract_tail_mcq_letter,
+    extract_valid_letter,
     iter_boxed_spans,
     mcq_canonical_response,
+    visible_answer_after_think_tags,
 )
 
-_FINAL_CUE_RE = re.compile(
-    r"(?:final\s+answer|therefore|thus|hence)\b",
-    re.IGNORECASE,
+_FINAL_CUE_RE = re.compile(r"(?:final\s+answer|therefore|thus|hence)\b", re.IGNORECASE)
+
+_TRAINING_ECHO_PATTERNS = (
+    "Solve this problem concisely",
+    "Solve the problem concisely",
+    "report only one final boxed answer",
+    "\\begin{solution}",
 )
 
 
-class BatchBudgetForcingProcessor(LogitsProcessor):
-    def __init__(self, end_think_token_id: int, think_budget: int, input_width: int):
-        self.end_think_token_id = end_think_token_id
-        self.think_budget = think_budget
-        self.input_width = input_width
-
-    def __call__(self, input_ids, scores):
-        if self.think_budget <= 0:
-            return scores
-
-        n_generated = input_ids.shape[1] - self.input_width
-        if n_generated < self.think_budget:
-            return scores
-
-        gen_region = input_ids[:, self.input_width :]
-        for row_idx in range(input_ids.shape[0]):
-            row_tokens = gen_region[row_idx].tolist()
-            if self.end_think_token_id not in row_tokens:
-                scores[row_idx, :] = float("-inf")
-                scores[row_idx, self.end_think_token_id] = 0.0
-        return scores
+def _has_training_echo(text: str) -> bool:
+    """Detect memorized training-template text from broken adapt LoRA outputs."""
+    head = text[:500]
+    return any(pattern in head for pattern in _TRAINING_ECHO_PATTERNS)
 
 
-class SmartBoxedStopProcessor(LogitsProcessor):
-    """Force EOS after a likely-final \\boxed{{...}}, not the first intermediate span."""
+def _extract_last_valid_letter(text: str, labels: list[str]) -> str:
+    """Return the last valid boxed MCQ letter in text.
 
-    def __init__(
-        self,
-        tokenizer,
-        input_width: int,
-        eos_token_id: int,
-        *,
-        min_tokens_before_stop: int,
-        post_box_patience_tokens: int,
-        cue_window_chars: int,
-        mcq_valid_per_row: list[set[str]] | None,
-    ):
-        self.tokenizer = tokenizer
-        self.input_width = input_width
-        self.eos_token_id = eos_token_id
-        self.min_tokens_before_stop = min_tokens_before_stop
-        self.post_box_patience_tokens = post_box_patience_tokens
-        self.cue_window_chars = cue_window_chars
-        self.mcq_valid_per_row = mcq_valid_per_row
+    This is safer than first-boxed extraction because broken LoRA runs can emit
+    fake early boxed letters before real reasoning.
+    """
+    valid = {label.strip().upper() for label in labels}
+    candidates: list[str] = []
 
-    def _should_force_eos_free(self, partial_clean: str, spans: list[tuple[int, int, str]]) -> bool:
-        start, end, _value = spans[-1]
-        after = partial_clean[end:]
-        after_ids = self.tokenizer.encode(after, add_special_tokens=False)
-        if len(after_ids) > self.post_box_patience_tokens:
-            return True
-        if not after.strip():
-            return True
-        ctx_start = max(0, start - self.cue_window_chars)
-        context = partial_clean[ctx_start:start]
-        if _FINAL_CUE_RE.search(context):
-            return True
-        return False
+    for _start, _end, inner in iter_boxed_spans(text):
+        cand = inner.strip().upper()
+        if cand in valid:
+            candidates.append(cand)
 
-    def _should_force_eos_mcq(self, row_idx: int, partial_clean: str, spans: list[tuple[int, int, str]]) -> bool:
-        valid_set = self.mcq_valid_per_row[row_idx] if self.mcq_valid_per_row else set()
-
-        first_valid_end: int | None = None
-        for start, end, val in spans:
-            inner = val.strip().upper()
-            if inner in valid_set:
-                first_valid_end = end
-                break
-
-        if first_valid_end is not None:
-            after = partial_clean[first_valid_end:]
-            after_ids = self.tokenizer.encode(after, add_special_tokens=False)
-            if len(after_ids) > self.post_box_patience_tokens:
-                return True
-            if not after.strip():
-                return True
-            if self.post_box_patience_tokens == 0 and len(after_ids) > 0:
-                return True
-            return False
-
-        start, end, _value = spans[-1]
-        after = partial_clean[end:]
-        after_ids = self.tokenizer.encode(after, add_special_tokens=False)
-        if len(after_ids) > self.post_box_patience_tokens:
-            return True
-        if not after.strip():
-            return True
-        ctx_start = max(0, start - self.cue_window_chars)
-        context = partial_clean[ctx_start:start]
-        if _FINAL_CUE_RE.search(context):
-            return True
-        return False
-
-    def __call__(self, input_ids, scores):
-        for row_idx in range(input_ids.shape[0]):
-            row_tokens = input_ids[row_idx, self.input_width :]
-            if row_tokens.numel() == 0:
-                continue
-
-            n_generated = int(row_tokens.shape[0])
-            if n_generated < self.min_tokens_before_stop:
-                continue
-
-            partial = self.tokenizer.decode(row_tokens, skip_special_tokens=False)
-            partial_clean = clean_special_tokens(partial)
-            spans = iter_boxed_spans(partial_clean)
-            if not spans:
-                continue
-
-            if self.mcq_valid_per_row is not None:
-                ok = self._should_force_eos_mcq(row_idx, partial_clean, spans)
-            else:
-                ok = self._should_force_eos_free(partial_clean, spans)
-
-            if ok:
-                scores[row_idx, :] = float("-inf")
-                scores[row_idx, self.eos_token_id] = 0.0
-        return scores
+    return candidates[-1] if candidates else ""
 
 
 class ModularPipeline:
@@ -179,44 +98,60 @@ class ModularPipeline:
         os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
 
         self.model_id = model_id
-        self.tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True, use_fast=False)
+        self.lora_adapter_path = lora_adapter_path
+
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_id,
+            trust_remote_code=True,
+            use_fast=False,
+        )
 
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.padding_side = "left"
 
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
-        )
-        self.llm = AutoModelForCausalLM.from_pretrained(
-            model_id,
+        try:
+            from vllm import LLM  # type: ignore
+            from vllm.lora.request import LoRARequest  # type: ignore
+        except Exception as exc:
+            raise RuntimeError(
+                "vLLM is required for inference. Install `vllm` and optionally `bitsandbytes`."
+            ) from exc
+
+        llm_kwargs: dict[str, Any] = dict(
+            model=model_id,
+            quantization=VLLM_QUANTIZATION,
+            load_format=VLLM_LOAD_FORMAT,
+            enable_prefix_caching=False,
+            gpu_memory_utilization=VLLM_GPU_MEMORY_UTILIZATION,
+            max_model_len=VLLM_MAX_MODEL_LEN,
             trust_remote_code=True,
-            quantization_config=bnb_config,
-            device_map="auto",
+            max_num_seqs=VLLM_MAX_NUM_SEQS,
+            max_num_batched_tokens=VLLM_MAX_NUM_BATCHED_TOKENS,
         )
+
+        self._lora_request = None
         if lora_adapter_path:
-            try:
-                from peft import PeftModel
-            except Exception as exc:
-                raise RuntimeError(
-                    "LoRA adapter path was provided, but PEFT is unavailable. "
-                    "Install `peft` to load adapters."
-                ) from exc
-            self.llm = PeftModel.from_pretrained(self.llm, lora_adapter_path)
+            llm_kwargs["enable_lora"] = True
+            self._lora_request = LoRARequest("adapter", 1, lora_adapter_path)
 
-        eot_ids = self.tokenizer.encode("</think>", add_special_tokens=False)
-        if len(eot_ids) == 1:
-            self.end_think_token_id = eot_ids[0]
-        else:
-            self.end_think_token_id = self.tokenizer.convert_tokens_to_ids("</think>")
+        print("Initializing vLLM with:")
+        print(f"  model_id={model_id}")
+        print(f"  lora_adapter_path={lora_adapter_path}")
+        print(f"  gpu_memory_utilization={VLLM_GPU_MEMORY_UTILIZATION}")
+        print(f"  max_model_len={VLLM_MAX_MODEL_LEN}")
+        print(f"  max_num_seqs={VLLM_MAX_NUM_SEQS}")
+        print(f"  max_num_batched_tokens={VLLM_MAX_NUM_BATCHED_TOKENS}")
+        print(f"  quantization={VLLM_QUANTIZATION}")
+        print(f"  load_format={VLLM_LOAD_FORMAT}")
 
-        self._judger = None
+        self.llm = LLM(**llm_kwargs)
+        self._judger: Any = None
 
     def _get_judger(self):
         if self._judger is False:
             return None
+
         if self._judger is None:
             try:
                 from judger import Judger
@@ -226,6 +161,7 @@ class ModularPipeline:
                 print(f"Warning: option-text Judger unavailable ({exc}); skipping that fallback.")
                 self._judger = False
                 return None
+
         return self._judger
 
     def _option_match_letter(self, primary_raw: str, options: list[str], labels: list[str]) -> str:
@@ -237,6 +173,7 @@ class ModularPipeline:
             pred = judger.extract_ans(primary_raw)
         except Exception:
             pred = extract_boxed(primary_raw)
+
         if not pred:
             return ""
 
@@ -246,14 +183,123 @@ class ModularPipeline:
                     return letter
             except Exception:
                 continue
+
         return ""
 
-    def _make_chat(self, system_prompt: str, user_prompt: str) -> str:
-        return self.tokenizer.apply_chat_template(
-            [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
-            tokenize=False,
-            add_generation_prompt=True,
+    def _make_chat(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        enable_thinking: bool = True,
+    ) -> str:
+        try:
+            return self.tokenizer.apply_chat_template(
+                [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=enable_thinking,
+            )
+        except TypeError:
+            if not enable_thinking:
+                user_prompt = user_prompt + "\n\n/no_think"
+            return self.tokenizer.apply_chat_template(
+                [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+
+    @staticmethod
+    def _build_vllm_sampling_params(
+        *,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+        repetition_penalty: float,
+        do_sample: bool,
+        no_repeat_ngram_size: int = 0,
+    ):
+        """Map HF-style do_sample to vLLM SamplingParams.
+
+        vLLM has no do_sample flag. Greedy decoding is temperature=0.
+        """
+        from vllm import SamplingParams  # type: ignore
+
+        if do_sample:
+            eff_temp = temperature
+            eff_top_p = top_p
+            eff_top_k = top_k if top_k > 0 else -1
+        else:
+            eff_temp = 0.0
+            eff_top_p = 1.0
+            eff_top_k = -1
+
+        sampling_kwargs: dict[str, Any] = dict(
+            max_tokens=max_tokens,
+            temperature=eff_temp,
+            top_p=eff_top_p,
+            top_k=eff_top_k,
+            min_p=0.0,
+            presence_penalty=0.0,
+            repetition_penalty=repetition_penalty,
         )
+
+        if no_repeat_ngram_size and no_repeat_ngram_size > 0:
+            sampling_kwargs["no_repeat_ngram_size"] = no_repeat_ngram_size
+
+        try:
+            return SamplingParams(**sampling_kwargs)
+        except TypeError:
+            sampling_kwargs.pop("no_repeat_ngram_size", None)
+            return SamplingParams(**sampling_kwargs)
+
+    def _truncate_for_smart_boxed_stop(
+        self,
+        *,
+        raw_clean: str,
+        mcq_valid: set[str] | None,
+        post_box_patience_tokens: int,
+    ) -> str:
+        """Post-hoc truncate to a likely-final boxed span.
+
+        This does not save generation time. It only cleans decoded text after vLLM finishes.
+        """
+        spans = iter_boxed_spans(raw_clean)
+        if not spans:
+            return raw_clean
+
+        if mcq_valid is not None:
+            valid_upper = {str(x).strip().upper() for x in mcq_valid}
+
+            valid_spans = []
+            for start, end, inner in spans:
+                if inner.strip().upper() not in valid_upper:
+                    continue
+
+                prefix = raw_clean[:end]
+                prefix_tokens = len(self.tokenizer.encode(prefix, add_special_tokens=False))
+                if prefix_tokens < MIN_TOKENS_BEFORE_BOXED_STOP:
+                    continue
+
+                valid_spans.append((start, end, inner))
+
+            if valid_spans:
+                _start, end, _inner = valid_spans[-1]
+                _ = post_box_patience_tokens
+                return raw_clean[:end].rstrip()
+
+            # Do not truncate MCQ output to a random non-letter box.
+            return raw_clean.rstrip()
+
+        # Free-form: keep up to the last complete boxed span.
+        return raw_clean[: spans[-1][1]].rstrip()
 
     def _generate_batch(
         self,
@@ -267,68 +313,72 @@ class ModularPipeline:
         repetition_penalty: float,
         do_sample: bool,
         think_budget: int,
+        enable_thinking: bool = True,
         force_smart_boxed_stop: bool = False,
         mcq_valid_per_row: list[set[str]] | None = None,
         post_box_patience_tokens: int = POST_BOX_PATIENCE_TOKENS_FREE,
         no_repeat_ngram_size: int = 0,
     ) -> list[dict]:
-        chats = [self._make_chat(system, user) for system, user in zip(system_prompts, user_prompts)]
-        inputs = self.tokenizer(
-            chats,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=16384,
-        ).to(self.llm.device)
+        # vLLM cannot enforce your old token-level think_budget logic.
+        del think_budget
 
-        input_width = inputs["input_ids"].shape[1]
-        logits_processors = [
-            BatchBudgetForcingProcessor(
-                end_think_token_id=self.end_think_token_id,
-                think_budget=think_budget,
-                input_width=input_width,
-            )
+        chats = [
+            self._make_chat(system, user, enable_thinking=enable_thinking)
+            for system, user in zip(system_prompts, user_prompts)
         ]
-        if force_smart_boxed_stop:
-            logits_processors.append(
-                SmartBoxedStopProcessor(
-                    tokenizer=self.tokenizer,
-                    input_width=input_width,
-                    eos_token_id=self.tokenizer.eos_token_id,
-                    min_tokens_before_stop=MIN_TOKENS_BEFORE_BOXED_STOP,
-                    post_box_patience_tokens=post_box_patience_tokens,
-                    cue_window_chars=FINAL_ANSWER_CUE_WINDOW_CHARS,
-                    mcq_valid_per_row=mcq_valid_per_row,
-                )
-            )
 
-        gen_kwargs = {
-            **inputs,
-            "max_new_tokens": max_new_tokens,
-            "do_sample": do_sample,
-            "repetition_penalty": repetition_penalty,
-            "logits_processor": logits_processors,
-            "pad_token_id": self.tokenizer.eos_token_id,
-            "eos_token_id": self.tokenizer.eos_token_id,
-        }
-        if do_sample:
-            gen_kwargs.update({"temperature": temperature, "top_p": top_p, "top_k": top_k})
-        if no_repeat_ngram_size and no_repeat_ngram_size > 0:
-            gen_kwargs["no_repeat_ngram_size"] = no_repeat_ngram_size
+        sampling_params = self._build_vllm_sampling_params(
+            max_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            repetition_penalty=repetition_penalty,
+            do_sample=do_sample,
+            no_repeat_ngram_size=no_repeat_ngram_size,
+        )
 
-        with torch.no_grad():
-            output_ids = self.llm.generate(**gen_kwargs)
+        llm_kwargs: dict[str, Any] = dict(
+            sampling_params=sampling_params,
+            use_tqdm=False,
+        )
+
+        if self._lora_request is not None:
+            llm_kwargs["lora_request"] = self._lora_request
+
+        request_outputs = self.llm.generate(chats, **llm_kwargs)
 
         results: list[dict] = []
-        for i in range(output_ids.shape[0]):
-            new_tokens = output_ids[i, input_width:]
-            raw = self.tokenizer.decode(new_tokens, skip_special_tokens=False).strip()
-            raw = clean_special_tokens(raw)
-            results.append({"raw": raw, "n_tokens": int(new_tokens.shape[0])})
+        for i, req_out in enumerate(request_outputs):
+            completion_text = req_out.outputs[0].text
+            raw_before_trunc = clean_special_tokens(completion_text).strip()
+            raw_clean = raw_before_trunc
+
+            if force_smart_boxed_stop:
+                mcq_valid = mcq_valid_per_row[i] if mcq_valid_per_row is not None else None
+                raw_clean = self._truncate_for_smart_boxed_stop(
+                    raw_clean=raw_clean,
+                    mcq_valid=mcq_valid,
+                    post_box_patience_tokens=post_box_patience_tokens,
+                )
+
+            pre_trunc_tokens = len(self.tokenizer.encode(raw_before_trunc, add_special_tokens=False))
+            post_trunc_tokens = len(self.tokenizer.encode(raw_clean, add_special_tokens=False))
+
+            results.append(
+                {
+                    "raw": raw_clean,
+                    "raw_before_trunc": raw_before_trunc,
+                    "n_tokens": int(post_trunc_tokens),
+                    "pre_trunc_n_tokens": int(pre_trunc_tokens),
+                    "generation_hit_max": bool(pre_trunc_tokens >= max_new_tokens),
+                    "raw_was_post_truncated": raw_clean.strip() != raw_before_trunc.strip(),
+                }
+            )
+
         return results
 
-    @staticmethod
     def _mcq_build_meta(
+        self,
         *,
         primary_raw: str,
         response: str,
@@ -341,12 +391,24 @@ class ModularPipeline:
         malformed_reason: str,
         finalizer_n_tokens: int = 0,
         boxed_in_raw: list[str],
+        training_echo_detected: bool = False,
+        pre_trunc_n_tokens: int | None = None,
+        generation_hit_max: bool | None = None,
+        confidence_tier: str = "",
+        guessed_letter_used: bool = False,
+        finalizer_extractor_path: str = "",
     ) -> dict:
         return {
             "is_mcq": True,
             "output_type": "mcq",
+            "model_id": self.model_id,
+            "lora_adapter_path": self.lora_adapter_path,
             "raw": primary_raw,
-            "n_tokens": n_tokens + finalizer_n_tokens,
+            "n_tokens": n_tokens,
+            "finalizer_n_tokens": finalizer_n_tokens,
+            "total_n_tokens": n_tokens + finalizer_n_tokens,
+            "pre_trunc_n_tokens": pre_trunc_n_tokens,
+            "generation_hit_max": generation_hit_max,
             "boxed": extract_boxed(response),
             "cleaned_response": response,
             "raw_was_truncated": response != primary_raw,
@@ -357,8 +419,86 @@ class ModularPipeline:
             "malformed_output": malformed,
             "malformed_reason": malformed_reason,
             "boxed_count_in_raw": len(boxed_in_raw),
-            "stop_policy": "smart_boxed",
+            "training_echo_detected": training_echo_detected,
+            "confidence_tier": confidence_tier,
+            "guessed_letter_used": guessed_letter_used,
+            "finalizer_extractor_path": finalizer_extractor_path,
+            "stop_policy": "smart_boxed_post",
         }
+
+    def _best_effort_mcq_guess(
+        self,
+        *,
+        primary_raw: str,
+        primary_raw_before_trunc: str,
+        finalizer_raw: str,
+        options: list[str],
+        labels: list[str],
+        training_echo_detected: bool,
+    ) -> tuple[str, bool, str, str]:
+        """Return (letter, option_match_used, extractor_path, confidence_tier)."""
+        letter = _extract_last_valid_letter(finalizer_raw, labels)
+        if letter:
+            return letter, False, "mcq_finalizer_last_valid_letter", "boxed_high"
+
+        letter = extract_tail_mcq_letter(finalizer_raw, labels)
+        if letter:
+            return letter, False, "mcq_finalizer_tail_phrase", "answer_phrase_medium"
+
+        for blob in (visible_answer_after_think_tags(finalizer_raw), finalizer_raw):
+            letter = extract_valid_letter(blob, labels) if blob else ""
+            if letter:
+                return letter, False, "mcq_finalizer_phrase_fulltext", "answer_phrase_medium"
+
+        if not training_echo_detected:
+            letter = _extract_last_valid_letter(primary_raw, labels)
+            if letter:
+                return letter, False, "mcq_last_valid_letter", "boxed_high"
+
+            letter = extract_tail_mcq_letter(primary_raw, labels)
+            if letter:
+                return letter, False, "mcq_primary_tail_phrase", "answer_phrase_medium"
+
+            for blob in (visible_answer_after_think_tags(primary_raw), primary_raw):
+                letter = extract_valid_letter(blob, labels) if blob else ""
+                if letter:
+                    return letter, False, "mcq_primary_phrase_fulltext", "answer_phrase_medium"
+
+            if primary_raw_before_trunc.strip() != primary_raw.strip():
+                letter = _extract_last_valid_letter(primary_raw_before_trunc, labels)
+                if letter:
+                    return letter, False, "mcq_pre_trunc_last_valid_letter", "boxed_high"
+
+                for blob in (
+                    visible_answer_after_think_tags(primary_raw_before_trunc),
+                    primary_raw_before_trunc,
+                ):
+                    letter = extract_valid_letter(blob, labels) if blob else ""
+                    if letter:
+                        return letter, False, "mcq_pre_trunc_phrase_fulltext", "answer_phrase_medium"
+
+            combo = f"{primary_raw}\n\n{finalizer_raw}"
+            for blob in (visible_answer_after_think_tags(combo), combo):
+                letter = extract_valid_letter(blob, labels) if blob else ""
+                if letter:
+                    return letter, False, "mcq_combined_phrase_fulltext", "answer_phrase_medium"
+
+                letter = extract_tail_mcq_letter(blob, labels) if blob else ""
+                if letter:
+                    return letter, False, "mcq_combined_tail_phrase", "answer_phrase_medium"
+
+            if primary_raw_before_trunc.strip() != primary_raw.strip():
+                combo_pre = f"{primary_raw_before_trunc}\n\n{finalizer_raw}"
+                for blob in (visible_answer_after_think_tags(combo_pre), combo_pre):
+                    letter = extract_valid_letter(blob, labels) if blob else ""
+                    if letter:
+                        return letter, False, "mcq_combined_pre_trunc_phrase", "answer_phrase_medium"
+
+            matched = self._option_match_letter(combo, options, labels)
+            if matched:
+                return matched, True, "mcq_option_match_judger", "option_match_medium"
+
+        return "", False, "mcq_abstain_no_signal", "none"
 
     def solve_mcq_batch(self, items: list[dict]) -> list[dict]:
         if not items:
@@ -366,8 +506,10 @@ class ModularPipeline:
 
         user_prompts = [build_mcq_user(item["question"], item["options"]) for item in items]
         system_prompts = [SYSTEM_PROMPT_MCQ] * len(items)
+
         mcq_valid = [
-            {chr(65 + j) for j in range(len(item["options"]))} for item in items
+            {chr(65 + j) for j in range(len(item["options"]))}
+            for item in items
         ]
 
         primary_outputs = self._generate_batch(
@@ -379,27 +521,60 @@ class ModularPipeline:
             top_k=TOP_K_MCQ,
             repetition_penalty=REP_PEN_MCQ,
             do_sample=False,
-            think_budget=THINK_BUDGET_MCQ,
+            think_budget=0,
+            enable_thinking=ENABLE_THINKING_MCQ_PRIMARY,
             force_smart_boxed_stop=True,
             mcq_valid_per_row=mcq_valid,
             post_box_patience_tokens=POST_BOX_PATIENCE_TOKENS_MCQ,
             no_repeat_ngram_size=NO_REPEAT_NGRAM_SIZE_MCQ,
         )
 
-        solved = [None] * len(items)
+        solved: list[dict | None] = [None] * len(items)
         finalizer_items: list[dict] = []
         finalizer_indices: list[int] = []
         primary_raws: list[str] = []
 
+        primary_pre_truncs: list[str] = []
+
         for idx, (item, out) in enumerate(zip(items, primary_outputs)):
             raw = out["raw"]
+            raw_pre = str(out.get("raw_before_trunc") or raw)
             labels = [chr(65 + i) for i in range(len(item["options"]))]
-            letter = extract_first_valid_letter(raw, labels)
-            primary_raws.append(raw)
             boxed_in_raw = extract_all_boxed(raw)
+            echo = _has_training_echo(raw)
+
+            letter = "" if echo else _extract_last_valid_letter(raw, labels)
+            extractor_path_primary = "mcq_last_valid_letter"
+            if not letter and not echo:
+                for blob in (visible_answer_after_think_tags(raw), raw):
+                    if not blob:
+                        continue
+                    letter = extract_valid_letter(blob, labels)
+                    if letter:
+                        extractor_path_primary = "mcq_primary_phrase_fulltext"
+                        break
+            if not letter and not echo and raw_pre.strip() != raw.strip():
+                letter = _extract_last_valid_letter(raw_pre, labels)
+                if letter:
+                    extractor_path_primary = "mcq_primary_pre_trunc_last_valid_letter"
+            if not letter and not echo and raw_pre.strip() != raw.strip():
+                for blob in (visible_answer_after_think_tags(raw_pre), raw_pre):
+                    if not blob:
+                        continue
+                    letter = extract_valid_letter(blob, labels)
+                    if letter:
+                        extractor_path_primary = "mcq_primary_pre_trunc_phrase"
+                        break
+
+            primary_raws.append(raw)
+            primary_pre_truncs.append(raw_pre)
 
             if letter:
                 response = mcq_canonical_response(letter)
+                phrase_only = extractor_path_primary in (
+                    "mcq_primary_phrase_fulltext",
+                    "mcq_primary_pre_trunc_phrase",
+                )
                 solved[idx] = {
                     "response": response,
                     "raw": raw,
@@ -409,11 +584,22 @@ class ModularPipeline:
                         n_tokens=out["n_tokens"],
                         finalizer_used=False,
                         option_match_used=False,
-                        extractor_path="mcq_first_valid_letter",
-                        fallback_used=False,
+                        extractor_path=extractor_path_primary,
+                        fallback_used=phrase_only,
                         malformed=False,
                         malformed_reason="",
                         boxed_in_raw=boxed_in_raw,
+                        training_echo_detected=echo,
+                        pre_trunc_n_tokens=out.get("pre_trunc_n_tokens"),
+                        generation_hit_max=out.get("generation_hit_max"),
+                        confidence_tier=(
+                            "boxed_high"
+                            if extractor_path_primary
+                            in ("mcq_last_valid_letter", "mcq_primary_pre_trunc_last_valid_letter")
+                            else "answer_phrase_medium"
+                        ),
+                        guessed_letter_used=phrase_only,
+                        finalizer_extractor_path="",
                     ),
                 }
             else:
@@ -421,30 +607,30 @@ class ModularPipeline:
                 finalizer_indices.append(idx)
 
         if finalizer_items:
-            finalizer_system_prompts = [
-                "You are selecting the final answer for a multiple-choice problem. "
-                "Use the previous reasoning and the options. "
-                "Output ONLY one valid letter inside \\boxed{}, nothing else."
-            ] * len(finalizer_items)
+            finalizer_system_prompts = [SYSTEM_PROMPT_MCQ] * len(finalizer_items)
+
             finalizer_user_prompts: list[str] = []
 
-            for item, original_idx in zip(finalizer_items, finalizer_indices):
+            for item, _original_idx in zip(finalizer_items, finalizer_indices):
                 labels = [chr(65 + i) for i in range(len(item["options"]))]
                 valid_letters = ", ".join(labels)
                 opts_text = "\n".join(
-                    f"{lbl}. {str(opt).strip()}" for lbl, opt in zip(labels, item["options"])
+                    f"{lbl}. {str(opt).strip()}"
+                    for lbl, opt in zip(labels, item["options"])
                 )
+
                 finalizer_user_prompts.append(
                     f"Question:\n{item['question']}\n\n"
                     f"Options:\n{opts_text}\n\n"
-                    f"Previous reasoning:\n{primary_raws[original_idx]}\n\n"
                     f"Valid choices: [{valid_letters}].\n"
-                    "Choose the option that best matches the reasoning. "
-                    "Output ONLY \\boxed{X}."
+                    "Return exactly one boxed letter in this format: \\boxed{X}, "
+                    "where X is one of the valid choices. "
+                    "Do not include explanation or extra text."
                 )
 
             fin_valid = [
-                {chr(65 + j) for j in range(len(item["options"]))} for item in finalizer_items
+                {chr(65 + j) for j in range(len(item["options"]))}
+                for item in finalizer_items
             ]
 
             finalizer_outputs = self._generate_batch(
@@ -457,68 +643,64 @@ class ModularPipeline:
                 repetition_penalty=REP_PEN_MCQ_FINAL,
                 do_sample=False,
                 think_budget=0,
-                force_smart_boxed_stop=True,
+                enable_thinking=False,
+                force_smart_boxed_stop=False,
                 mcq_valid_per_row=fin_valid,
-                post_box_patience_tokens=POST_BOX_PATIENCE_TOKENS_MCQ,
+                post_box_patience_tokens=0,
                 no_repeat_ngram_size=NO_REPEAT_NGRAM_SIZE_MCQ_FINAL,
             )
 
             for original_idx, fout in zip(finalizer_indices, finalizer_outputs):
                 item = items[original_idx]
                 labels = [chr(65 + i) for i in range(len(item["options"]))]
-                letter = extract_first_valid_letter(fout["raw"], labels)
-                option_match_used = False
+
                 raw = primary_raws[original_idx]
                 boxed_in_raw = extract_all_boxed(raw)
-
-                if not letter:
-                    matched = self._option_match_letter(raw, item["options"], labels)
-                    if matched:
-                        letter = matched
-                        option_match_used = True
-
-                if not letter:
-                    response = mcq_canonical_response("")
-                    solved[original_idx] = {
-                        "response": response,
-                        "raw": raw,
-                        "meta": self._mcq_build_meta(
-                            primary_raw=raw,
-                            response=response,
-                            n_tokens=primary_outputs[original_idx]["n_tokens"] + fout["n_tokens"],
-                            finalizer_used=True,
-                            option_match_used=option_match_used,
-                            extractor_path="none",
-                            fallback_used=True,
-                            malformed=True,
-                            malformed_reason="no_valid_mcq_letter",
-                            finalizer_n_tokens=fout["n_tokens"],
-                            boxed_in_raw=boxed_in_raw,
-                        ),
-                    }
-                    continue
+                echo = _has_training_echo(raw)
+                letter, option_match_used, path, confidence_tier = self._best_effort_mcq_guess(
+                    primary_raw=raw,
+                    primary_raw_before_trunc=primary_pre_truncs[original_idx],
+                    finalizer_raw=fout["raw"],
+                    options=item["options"],
+                    labels=labels,
+                    training_echo_detected=echo,
+                )
 
                 response = mcq_canonical_response(letter)
-                path = "mcq_finalizer_letter" if not option_match_used else "mcq_option_match_judger"
+                guessed_letter_used = confidence_tier in {
+                    "answer_phrase_medium",
+                    "option_match_medium",
+                }
+                malformed = not bool(letter)
+                malformed_reason = ""
+                if malformed:
+                    malformed_reason = "training_echo" if echo else "no_valid_mcq_letter"
+
                 solved[original_idx] = {
                     "response": response,
                     "raw": raw,
                     "meta": self._mcq_build_meta(
                         primary_raw=raw,
                         response=response,
-                        n_tokens=primary_outputs[original_idx]["n_tokens"] + fout["n_tokens"],
+                        n_tokens=primary_outputs[original_idx]["n_tokens"],
                         finalizer_used=True,
                         option_match_used=option_match_used,
                         extractor_path=path,
-                        fallback_used=False,
-                        malformed=False,
-                        malformed_reason="",
+                        fallback_used=guessed_letter_used,
+                        malformed=malformed,
+                        malformed_reason=malformed_reason,
                         finalizer_n_tokens=fout["n_tokens"],
                         boxed_in_raw=boxed_in_raw,
+                        training_echo_detected=echo,
+                        pre_trunc_n_tokens=primary_outputs[original_idx].get("pre_trunc_n_tokens"),
+                        generation_hit_max=primary_outputs[original_idx].get("generation_hit_max"),
+                        confidence_tier=confidence_tier,
+                        guessed_letter_used=guessed_letter_used,
+                        finalizer_extractor_path=path,
                     ),
                 }
 
-        return solved
+        return [x for x in solved if x is not None]
 
     def solve_free_batch(self, items: list[dict]) -> list[dict]:
         if not items:
@@ -526,6 +708,7 @@ class ModularPipeline:
 
         user_prompts = [build_free_user(item["question"]) for item in items]
         system_prompts = [SYSTEM_PROMPT_FREE] * len(items)
+
         outputs = self._generate_batch(
             system_prompts,
             user_prompts,
@@ -535,7 +718,7 @@ class ModularPipeline:
             top_k=TOP_K_FREE,
             repetition_penalty=REP_PEN_FREE,
             do_sample=True,
-            think_budget=THINK_BUDGET_FREE,
+            think_budget=0,
             force_smart_boxed_stop=True,
             mcq_valid_per_row=None,
             post_box_patience_tokens=POST_BOX_PATIENCE_TOKENS_FREE,
@@ -543,10 +726,12 @@ class ModularPipeline:
         )
 
         solved: list[dict] = []
+
         for out in outputs:
             raw = out["raw"]
             response, extract_meta = canonicalize_free_response_with_meta(raw)
             boxed_in_raw = extract_meta.get("boxed_candidates") or extract_all_boxed(raw)
+
             solved.append(
                 {
                     "response": response,
@@ -554,11 +739,16 @@ class ModularPipeline:
                     "meta": {
                         "is_mcq": False,
                         "output_type": "free",
+                        "model_id": self.model_id,
+                        "lora_adapter_path": self.lora_adapter_path,
                         "raw": raw,
                         "n_tokens": out["n_tokens"],
+                        "pre_trunc_n_tokens": out.get("pre_trunc_n_tokens"),
+                        "generation_hit_max": out.get("generation_hit_max"),
                         "boxed": extract_boxed(response),
                         "cleaned_response": response,
                         "raw_was_truncated": response.strip() != raw.strip(),
+                        "raw_was_post_truncated": out.get("raw_was_post_truncated", False),
                         "boxed_fallback_used": bool(extract_meta.get("fallback_used")),
                         "extractor_path": extract_meta.get("extractor_path", "free"),
                         "boxed_count_in_raw": extract_meta.get("boxed_count_in_raw", len(boxed_in_raw)),
@@ -566,8 +756,10 @@ class ModularPipeline:
                         "cue_matched": extract_meta.get("cue_matched", False),
                         "malformed_output": extract_meta.get("malformed_output", False),
                         "malformed_reason": extract_meta.get("malformed_reason", ""),
-                        "stop_policy": "smart_boxed",
+                        "training_echo_detected": _has_training_echo(raw),
+                        "stop_policy": "smart_boxed_post",
                     },
                 }
             )
+
         return solved

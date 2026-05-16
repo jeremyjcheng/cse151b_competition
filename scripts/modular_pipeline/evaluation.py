@@ -7,7 +7,21 @@ from typing import Optional
 
 from tqdm import tqdm
 
-from text_processing import extract_all_boxed, extract_valid_letter
+from text_processing import extract_all_boxed, extract_valid_letter, iter_boxed_spans
+
+
+def _has_exactly_one_valid_mcq_box(text: str, labels: list[str]) -> bool:
+    """True when text has exactly one boxed span and it is a valid option letter."""
+    if not labels:
+        return False
+    boxed_spans = iter_boxed_spans(text)
+    if len(boxed_spans) != 1:
+        return False
+    inner = boxed_spans[0][2].strip()
+    # Route through MCQ extraction logic on a synthetic one-box text to
+    # support wrappers like \boxed{\text{A}} while avoiding phrase matching.
+    letter = extract_valid_letter(f"\\boxed{{{inner}}}", labels)
+    return bool(letter)
 
 
 class _JudgeTimeout(Exception):
@@ -80,6 +94,12 @@ def evaluate_with_judger(data: list[dict], records_by_id: dict) -> None:
     raw_multi_box = 0
     malformed_flag_meta = 0
     extractor_counts: dict[str, int] = {}
+    mcq_raw_strict_valid = 0
+    mcq_recovered_valid = 0
+    mcq_empty_boxed = 0
+    mcq_invalid_boxed = 0
+    mcq_generation_hit_max = 0
+    mcq_finalizer_used = 0
 
     for item in tqdm(data, desc="Scoring with Judger"):
         answer = item.get("answer")
@@ -131,6 +151,17 @@ def evaluate_with_judger(data: list[dict], records_by_id: dict) -> None:
         if is_mcq:
             mcq_total += 1
             mcq_correct += int(ok)
+            raw_text = str(rec.get("raw") or meta.get("raw") or "")
+            final_has_valid_letter = bool(labels and extract_valid_letter(pred, labels))
+            raw_is_strict_valid = _has_exactly_one_valid_mcq_box(raw_text, labels)
+            final_is_strict_valid = _has_exactly_one_valid_mcq_box(pred, labels)
+
+            mcq_recovered_valid += int(final_has_valid_letter)
+            mcq_raw_strict_valid += int(raw_is_strict_valid)
+            mcq_generation_hit_max += int(bool(meta.get("generation_hit_max")))
+            mcq_finalizer_used += int(bool(meta.get("finalizer_used")))
+            mcq_empty_boxed += int(any(not str(v).strip() for v in boxed_values))
+            mcq_invalid_boxed += int(bool(boxed_values) and not final_is_strict_valid)
         else:
             free_total += 1
             free_correct += int(ok)
@@ -165,6 +196,27 @@ def evaluate_with_judger(data: list[dict], records_by_id: dict) -> None:
         f"  Diagnostics: raw_multi_boxed_spans={raw_multi_box}, "
         f"meta_malformed_flag={malformed_flag_meta}"
     )
+    if mcq_total:
+        raw_strict_rate = acc(mcq_raw_strict_valid, mcq_total)
+        recovered_rate = acc(mcq_recovered_valid, mcq_total)
+        recovered_gap = recovered_rate - raw_strict_rate
+        print(
+            "  MCQ quality : "
+            f"raw_strict_valid={mcq_raw_strict_valid}/{mcq_total} ({raw_strict_rate:.2f}%), "
+            f"recovered_valid={mcq_recovered_valid}/{mcq_total} ({recovered_rate:.2f}%), "
+            f"recovered_raw_gap={recovered_gap:.2f} pts"
+        )
+        print(
+            "  MCQ format  : "
+            f"empty_boxed={mcq_empty_boxed}/{mcq_total} ({acc(mcq_empty_boxed, mcq_total):.2f}%), "
+            f"invalid_boxed={mcq_invalid_boxed}/{mcq_total} ({acc(mcq_invalid_boxed, mcq_total):.2f}%)"
+        )
+        print(
+            "  MCQ runtime : "
+            f"generation_hit_max={mcq_generation_hit_max}/{mcq_total} "
+            f"({acc(mcq_generation_hit_max, mcq_total):.2f}%), "
+            f"finalizer_used={mcq_finalizer_used}/{mcq_total} ({acc(mcq_finalizer_used, mcq_total):.2f}%)"
+        )
     if extractor_counts:
         top_paths = sorted(extractor_counts.items(), key=lambda x: -x[1])[:12]
         paths_str = ", ".join(f"{k}={v}" for k, v in top_paths)

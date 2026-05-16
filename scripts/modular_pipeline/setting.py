@@ -2,7 +2,22 @@
 
 MODEL_ID = "Qwen/Qwen3-4B-Thinking-2507"
 
+# ============================================================
+# vLLM engine defaults
+# ============================================================
+
+VLLM_GPU_MEMORY_UTILIZATION = 0.85
+VLLM_MAX_MODEL_LEN = 8192
+VLLM_MAX_NUM_SEQS = 32
+VLLM_MAX_NUM_BATCHED_TOKENS = 8192
+VLLM_QUANTIZATION = "bitsandbytes"
+VLLM_LOAD_FORMAT = "bitsandbytes"
+
+
+# ============================================================
 # LoRA defaults
+# ============================================================
+
 LORA_R = 16
 LORA_ALPHA = 32
 LORA_DROPOUT = 0.05
@@ -16,7 +31,11 @@ LORA_TARGET_MODULES = (
     "down_proj",
 )
 
+
+# ============================================================
 # Training defaults
+# ============================================================
+
 TRAIN_BATCH_SIZE = 1
 GRAD_ACCUM_STEPS = 16
 LEARNING_RATE = 8e-5
@@ -29,51 +48,99 @@ SAVE_EVERY_STEPS = 100
 # Stage-specific train defaults
 REASONING_DEFAULT_LEARNING_RATE = 8e-5
 REASONING_DEFAULT_MAX_STEPS = 1000
-ADAPT_DEFAULT_LEARNING_RATE = 5e-5
-ADAPT_DEFAULT_MAX_STEPS = 150
 
-# MCQ settings
-MAX_TOKENS_MCQ = 1024
-THINK_BUDGET_MCQ = 512
-MAX_TOKENS_MCQ_FINAL = 96
+# Stage-2 adaptation previously looked like it overfit / echoed target templates.
+ADAPT_DEFAULT_LEARNING_RATE = 2e-5
+ADAPT_DEFAULT_MAX_STEPS = 100
+
+
+# ============================================================
+# MCQ generation settings
+# ============================================================
+
+# Room to finish reasoning and emit a final \\boxed{X} (truncation hurts correctness).
+MAX_TOKENS_MCQ = 4096
+
+# Ignored by vLLM backend, kept for compatibility with older HF path.
+THINK_BUDGET_MCQ = 0
+
+# Finalizer only emits one box; a bit of headroom avoids cut-off \\boxed{}.
+MAX_TOKENS_MCQ_FINAL = 512
+
+# Greedy MCQ decoding.
 TEMP_MCQ = 0.0
 TOP_P_MCQ = 1.0
 TOP_K_MCQ = 0
-REP_PEN_MCQ = 1.18
-REP_PEN_MCQ_FINAL = 1.05
 
-# Generation: stop after boxed (final-answer-aware; see model_pipeline.SmartBoxedStopProcessor)
-MIN_TOKENS_BEFORE_BOXED_STOP = 48
-POST_BOX_PATIENCE_TOKENS_FREE = 64
+# Keep repetition penalties neutral for MCQ. Higher values were likely hurting output.
+REP_PEN_MCQ = 1.0
+REP_PEN_MCQ_FINAL = 1.0
+
+
+# ============================================================
+# Stop / truncation settings
+# ============================================================
+
+MIN_TOKENS_BEFORE_BOXED_STOP = 64
+
+POST_BOX_PATIENCE_TOKENS_FREE = 256
 POST_BOX_PATIENCE_TOKENS_MCQ = 0
-FINAL_ANSWER_CUE_WINDOW_CHARS = 180
 
-# Optional n-gram blocking (0 = disabled for HF generate)
-NO_REPEAT_NGRAM_SIZE_MCQ = 4
-NO_REPEAT_NGRAM_SIZE_MCQ_FINAL = 3
-NO_REPEAT_NGRAM_SIZE_FREE = 4
+FINAL_ANSWER_CUE_WINDOW_CHARS = 600
 
-# Free-form settings
-MAX_TOKENS_FREE = 2048
-THINK_BUDGET_FREE = 1024
+
+# ============================================================
+# Optional n-gram blocking
+# ============================================================
+
+# Disabled because it can interfere with math reasoning and option comparison.
+NO_REPEAT_NGRAM_SIZE_MCQ = 0
+NO_REPEAT_NGRAM_SIZE_MCQ_FINAL = 0
+NO_REPEAT_NGRAM_SIZE_FREE = 0
+
+
+# ============================================================
+# Free-form generation settings
+# ============================================================
+
+MAX_TOKENS_FREE = 8192
+
+# Ignored by vLLM backend, kept for compatibility with older HF path.
+THINK_BUDGET_FREE = 0
+
+# Keep free-form mostly stable because it was much better than MCQ.
 TEMP_FREE = 0.1
 TOP_P_FREE = 0.9
 TOP_K_FREE = 10
-REP_PEN_FREE = 1.18
+REP_PEN_FREE = 1.05
 
-MCQ_BATCH_SIZE = 8
+
+# ============================================================
+# Batch sizes
+# ============================================================
+
+MCQ_BATCH_SIZE = 12
 FREE_BATCH_SIZE = 2
 
+# ============================================================
+# Thinking mode toggles
+# ============================================================
+
+ENABLE_THINKING_MCQ_PRIMARY = True
+ENABLE_THINKING_MCQ_FINAL = False
+ENABLE_THINKING_FREE = True
+
+# ============================================================
+# Prompts
+# ============================================================
+
 SYSTEM_PROMPT_MCQ = (
-    "Solve the multiple-choice math problem. "
-    "Reason briefly and efficiently. "
-    "Compute the result first. "
-    "Compare your result to the options. "
-    "Choose the closest valid option. "
-    "Output exactly one final answer in the form \\boxed{X}. "
-    "Do not output multiple boxed answers. "
-    "Do not repeat yourself. "
-    "Stop immediately after writing the final boxed answer."
+    "You are solving a multiple-choice math problem. "
+    "You may think step by step, but the final line must be exactly one "
+    "boxed option letter from the listed choices, like \\boxed{A}. "
+    "Do not box numbers or expressions. "
+    "Do not output more than one \\boxed{...}. "
+    "Stop immediately after that final box."
 )
 
 SYSTEM_PROMPT_FREE = (
@@ -84,7 +151,7 @@ SYSTEM_PROMPT_FREE = (
     "Do not box intermediate answers. "
     "If multiple [ANS] slots exist, output exactly that many values "
     "inside a single \\boxed{...}, comma-separated. "
-    "Stop immediately after the final boxed answer."
+    "After the final boxed answer, stop."
 )
 
 MCQ_FEWSHOT = (
@@ -94,5 +161,5 @@ MCQ_FEWSHOT = (
     "B. 5\n"
     "C. 6\n"
     "D. 7\n\n"
-    "2+3=5, so the answer is \\boxed{B}.\n\n"
+    "\\boxed{B}\n\n"
 )
