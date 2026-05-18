@@ -118,7 +118,12 @@ def main() -> None:
     print(f"Remaining questions to solve: {len(remaining_data)}")
 
     if remaining_data:
-        pipe = ModularPipeline(gpu_id=args.gpu_id, lora_adapter_path=args.lora_adapter_path)
+        pipe = ModularPipeline(
+            gpu_id=args.gpu_id,
+            lora_adapter_path=args.lora_adapter_path,
+            vllm_quantization=args.vllm_quantization,
+            vllm_load_format=args.vllm_load_format,
+        )
         mcq_items = [item for item in remaining_data if item.get("options")]
         free_items = [item for item in remaining_data if not item.get("options")]
 

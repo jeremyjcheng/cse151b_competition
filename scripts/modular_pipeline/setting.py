@@ -6,13 +6,21 @@ MODEL_ID = "Qwen/Qwen3-4B-Thinking-2507"
 # vLLM engine defaults
 # ============================================================
 
-VLLM_GPU_MEMORY_UTILIZATION = 0.85
-VLLM_MAX_MODEL_LEN = 8192
-VLLM_MAX_NUM_SEQS = 32
-VLLM_MAX_NUM_BATCHED_TOKENS = 8192
+VLLM_GPU_MEMORY_UTILIZATION = 0.70
+VLLM_MAX_MODEL_LEN = 4096
+VLLM_MAX_NUM_SEQS = 4
+VLLM_MAX_NUM_BATCHED_TOKENS = 4096
 VLLM_QUANTIZATION = "bitsandbytes"
 VLLM_LOAD_FORMAT = "bitsandbytes"
 
+# Avoid CUDA graph capture OOM during sanity checks / small inference runs.
+VLLM_ENFORCE_EAGER = True
+
+# vLLM LoRA: max_loras caps concurrent adapters; max_lora_rank is set after LORA_R below.
+VLLM_MAX_LORAS = 1
+
+# Qwen3 dense LoRA in vLLM improved across 0.10+; upgrade if logs show Transformers fallback.
+VLLM_MIN_VERSION = "0.10.0"
 
 # ============================================================
 # LoRA defaults
@@ -30,6 +38,9 @@ LORA_TARGET_MODULES = (
     "up_proj",
     "down_proj",
 )
+
+# Match training rank unless adapter_config.json specifies a higher rank.
+VLLM_MAX_LORA_RANK = LORA_R
 
 
 # ============================================================
@@ -49,9 +60,18 @@ SAVE_EVERY_STEPS = 100
 REASONING_DEFAULT_LEARNING_RATE = 8e-5
 REASONING_DEFAULT_MAX_STEPS = 1000
 
-# Stage-2 adaptation previously looked like it overfit / echoed target templates.
-ADAPT_DEFAULT_LEARNING_RATE = 2e-5
-ADAPT_DEFAULT_MAX_STEPS = 100
+# Stage-2 adaptation should remain conservative:
+# keep updates small so the model learns output format without overriding Stage-1 reasoning.
+ADAPT_DEFAULT_LEARNING_RATE = 1e-5
+ADAPT_DEFAULT_MAX_STEPS = 60
+
+# Reserve this fraction of public supervised items for eval only (never used in Stage-2 training).
+# Public is your pre-submit dev set — do not train on all of it if you score on it before private.
+STAGE2_DEFAULT_HOLDOUT_FRACTION = 0.3
+
+# Cap Stage-2 training size on public data (in addition to holdout split).
+STAGE2_TRAIN_LIMIT_MCQ = 50
+STAGE2_TRAIN_LIMIT_FREE = 25
 
 
 # ============================================================

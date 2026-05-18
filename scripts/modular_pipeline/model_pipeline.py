@@ -7,13 +7,21 @@ safer MCQ extraction and stronger finalizer recovery.
 
 import os
 import re
+from pathlib import Path
 from typing import Any
 
 from transformers import AutoTokenizer
 
+from lora_vllm_utils import (
+    check_vllm_version,
+    normalize_vllm_optional,
+    resolve_max_lora_rank,
+    validate_lora_adapter_dir,
+)
 from prompting import build_free_user, build_mcq_user
 from settings import (
     ENABLE_THINKING_MCQ_PRIMARY,
+    VLLM_ENFORCE_EAGER,
     FINAL_ANSWER_CUE_WINDOW_CHARS,
     MAX_TOKENS_FREE,
     MAX_TOKENS_MCQ,
@@ -38,9 +46,12 @@ from settings import (
     TOP_P_MCQ,
     VLLM_GPU_MEMORY_UTILIZATION,
     VLLM_LOAD_FORMAT,
+    VLLM_MAX_LORA_RANK,
+    VLLM_MAX_LORAS,
     VLLM_MAX_MODEL_LEN,
     VLLM_MAX_NUM_BATCHED_TOKENS,
     VLLM_MAX_NUM_SEQS,
+    VLLM_MIN_VERSION,
     VLLM_QUANTIZATION,
 )
 from text_processing import (
@@ -88,17 +99,48 @@ def _extract_last_valid_letter(text: str, labels: list[str]) -> str:
     return candidates[-1] if candidates else ""
 
 
+def _apply_vllm_quantization_kwargs(
+    llm_kwargs: dict[str, Any],
+    *,
+    quantization: str | None,
+    load_format: str | None,
+) -> None:
+    """Set or omit vLLM quantization/load_format keys."""
+    if quantization is not None:
+        llm_kwargs["quantization"] = quantization
+    if load_format is not None:
+        llm_kwargs["load_format"] = load_format
+
+
 class ModularPipeline:
     def __init__(
         self,
         gpu_id: str = "0",
         model_id: str = MODEL_ID,
         lora_adapter_path: str | None = None,
+        vllm_quantization: str | None = None,
+        vllm_load_format: str | None = None,
     ):
         os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
 
+        check_vllm_version(VLLM_MIN_VERSION)
+
         self.model_id = model_id
-        self.lora_adapter_path = lora_adapter_path
+        self.vllm_quantization = (
+            normalize_vllm_optional(vllm_quantization)
+            if vllm_quantization is not None
+            else VLLM_QUANTIZATION
+        )
+        self.vllm_load_format = (
+            normalize_vllm_optional(vllm_load_format)
+            if vllm_load_format is not None
+            else VLLM_LOAD_FORMAT
+        )
+
+        resolved_adapter: Path | None = None
+        if lora_adapter_path:
+            resolved_adapter = validate_lora_adapter_dir(lora_adapter_path)
+        self.lora_adapter_path = str(resolved_adapter) if resolved_adapter else None
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_id,
@@ -120,30 +162,48 @@ class ModularPipeline:
 
         llm_kwargs: dict[str, Any] = dict(
             model=model_id,
-            quantization=VLLM_QUANTIZATION,
-            load_format=VLLM_LOAD_FORMAT,
             enable_prefix_caching=False,
             gpu_memory_utilization=VLLM_GPU_MEMORY_UTILIZATION,
             max_model_len=VLLM_MAX_MODEL_LEN,
             trust_remote_code=True,
             max_num_seqs=VLLM_MAX_NUM_SEQS,
             max_num_batched_tokens=VLLM_MAX_NUM_BATCHED_TOKENS,
+            enforce_eager=VLLM_ENFORCE_EAGER,
+        )
+        _apply_vllm_quantization_kwargs(
+            llm_kwargs,
+            quantization=self.vllm_quantization,
+            load_format=self.vllm_load_format,
         )
 
         self._lora_request = None
-        if lora_adapter_path:
+        self._max_lora_rank = VLLM_MAX_LORA_RANK
+        if resolved_adapter is not None:
+            self._max_lora_rank = resolve_max_lora_rank(resolved_adapter)
             llm_kwargs["enable_lora"] = True
-            self._lora_request = LoRARequest("adapter", 1, lora_adapter_path)
+            llm_kwargs["max_lora_rank"] = self._max_lora_rank
+            llm_kwargs["max_loras"] = VLLM_MAX_LORAS
+            self._lora_request = LoRARequest("adapter", 1, str(resolved_adapter))
 
         print("Initializing vLLM with:")
+        print(f"  enforce_eager={VLLM_ENFORCE_EAGER}")
         print(f"  model_id={model_id}")
-        print(f"  lora_adapter_path={lora_adapter_path}")
+        print(f"  lora_adapter_path={self.lora_adapter_path}")
         print(f"  gpu_memory_utilization={VLLM_GPU_MEMORY_UTILIZATION}")
         print(f"  max_model_len={VLLM_MAX_MODEL_LEN}")
         print(f"  max_num_seqs={VLLM_MAX_NUM_SEQS}")
         print(f"  max_num_batched_tokens={VLLM_MAX_NUM_BATCHED_TOKENS}")
-        print(f"  quantization={VLLM_QUANTIZATION}")
-        print(f"  load_format={VLLM_LOAD_FORMAT}")
+        print(f"  quantization={self.vllm_quantization}")
+        print(f"  load_format={self.vllm_load_format}")
+        if resolved_adapter is not None:
+            print("  enable_lora=True")
+            print(f"  max_lora_rank={self._max_lora_rank}")
+            print(f"  max_loras={VLLM_MAX_LORAS}")
+            print(
+                "  LoRA diagnostics: watch vLLM startup logs for SupportsLoRA, "
+                "Qwen3ForCausalLM, or 'falling back to Transformers' — fallback can "
+                "mean LoRA is not applied natively."
+            )
 
         self.llm = LLM(**llm_kwargs)
         self._judger: Any = None

@@ -5,6 +5,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+from settings import (
+    STAGE2_DEFAULT_HOLDOUT_FRACTION,
+    STAGE2_TRAIN_LIMIT_FREE,
+    STAGE2_TRAIN_LIMIT_MCQ,
+)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -18,7 +24,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--adapt-input",
         default="public",
-        help="Competition split/path used for Stage 2 adaptation (default: public).",
+        help=(
+            "Competition split/path used for Stage 2 adaptation (default: public). "
+            "Public is your dev set — use holdout + limits so you do not memorize it."
+        ),
     )
     parser.add_argument(
         "--infer-input",
@@ -39,9 +48,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--adapt-steps",
+        "--stage2-max-steps",
+        dest="stage2_max_steps",
         type=int,
-        default=150,
-        help="Stage 2 (adaptation) optimizer steps.",
+        default=60,
+        help="Stage 2 (adaptation) optimizer steps. Keep low to avoid overfitting public labels.",
     )
     parser.add_argument("--batch-size", type=int, default=1, help="Train micro-batch size.")
     parser.add_argument(
@@ -58,9 +69,58 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--adapt-learning-rate",
+        "--stage2-learning-rate",
+        dest="stage2_learning_rate",
         type=float,
-        default=5e-5,
-        help="Stage 2 learning rate.",
+        default=1e-5,
+        help="Stage 2 learning rate. Conservative default to preserve Stage-1 reasoning.",
+    )
+    parser.add_argument(
+        "--stage2-train-on-full-chat",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "If enabled, Stage 2 trains on full assistant traces. "
+            "Keep disabled to reduce memorization of public answer style."
+        ),
+    )
+    parser.add_argument(
+        "--stage2-final-answer-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "If enabled (default), Stage 2 supervises only final boxed answers for safer "
+            "format adaptation."
+        ),
+    )
+    parser.add_argument(
+        "--stage2-freeze-reasoning-style",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "If enabled (default), Stage 2 prompts emphasize preserving Stage-1 reasoning style."
+        ),
+    )
+    parser.add_argument(
+        "--stage2-sanity-check",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run a small base-vs-stage1-vs-stage2 sanity comparison after Stage 2.",
+    )
+    parser.add_argument(
+        "--stage2-holdout-fraction",
+        type=float,
+        default=STAGE2_DEFAULT_HOLDOUT_FRACTION,
+        help=(
+            "Fraction of supervised public items reserved for eval only (default: 0.25). "
+            "Stage 2 never trains on holdout items."
+        ),
+    )
+    parser.add_argument(
+        "--stage2-holdout-seed",
+        type=int,
+        default=0,
+        help="Seed for Stage-2 train/holdout split.",
     )
     parser.add_argument(
         "--max-seq-length",
@@ -109,20 +169,43 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--limit-mcq",
         type=int,
-        default=None,
-        help="Optional MCQ subset cap for training.",
+        default=STAGE2_TRAIN_LIMIT_MCQ,
+        help=(
+            "MCQ cap for Stage-2 training on public data (default: "
+            f"{STAGE2_TRAIN_LIMIT_MCQ}). Use 0 or a large value to disable cap."
+        ),
     )
     parser.add_argument(
         "--limit-free",
         type=int,
-        default=None,
-        help="Optional free-form subset cap for training.",
+        default=STAGE2_TRAIN_LIMIT_FREE,
+        help=(
+            "Free-form cap for Stage-2 training on public data (default: "
+            f"{STAGE2_TRAIN_LIMIT_FREE}). Use 0 or a large value to disable cap."
+        ),
     )
     parser.add_argument(
         "--sample-seed",
         type=int,
         default=0,
         help="Subset seed when using --limit-mcq/--limit-free.",
+    )
+    parser.add_argument(
+        "--verify-lora-before-infer",
+        action="store_true",
+        help=(
+            "Run verify_lora_vllm.py on the inference adapter before modular_pipeline.py."
+        ),
+    )
+    parser.add_argument(
+        "--vllm-quantization",
+        default=None,
+        help="Forwarded to inference / LoRA verify (use 'none' to disable BnB).",
+    )
+    parser.add_argument(
+        "--vllm-load-format",
+        default=None,
+        help="Forwarded to inference / LoRA verify (e.g. auto with --vllm-quantization none).",
     )
     parser.add_argument(
         "--skip-infer",
@@ -150,6 +233,28 @@ def parse_args() -> argparse.Namespace:
 def _append_optional(cmd: list[str], flag: str, value) -> None:
     if value is not None:
         cmd.extend([flag, str(value)])
+
+
+def _stage2_train_limit(value: int | None) -> int | None:
+    """Treat 0 as 'no cap' for Stage-2 subset limits."""
+    if value is None or value <= 0:
+        return None
+    return value
+
+
+def _eval_input_for_stage2(stage2_root: Path, fallback: str) -> str:
+    holdout_path = stage2_root / "stage2_holdout.jsonl"
+    if holdout_path.exists():
+        print(
+            f"Using Stage-2 holdout for local checks: {holdout_path} "
+            "(items never seen during Stage-2 training)."
+        )
+        return str(holdout_path)
+    print(
+        "Warning: stage2_holdout.jsonl not found; falling back to full public for local checks. "
+        "Prefer holdout scoring to avoid optimistic dev scores."
+    )
+    return fallback
 
 
 def main() -> None:
@@ -226,13 +331,13 @@ def main() -> None:
             "--gpu-id",
             args.gpu_id,
             "--max-steps",
-            str(args.adapt_steps),
+            str(args.stage2_max_steps),
             "--batch-size",
             str(args.batch_size),
             "--grad-accum-steps",
             str(args.grad_accum_steps),
             "--learning-rate",
-            str(args.adapt_learning_rate),
+            str(args.stage2_learning_rate),
             "--sample-seed",
             str(args.sample_seed),
             "--max-seq-length",
@@ -240,17 +345,80 @@ def main() -> None:
             "--resume-from-adapter",
             str(stage1_adapter_path),
         ]
-        _append_optional(stage2_cmd, "--limit-mcq", args.limit_mcq)
-        _append_optional(stage2_cmd, "--limit-free", args.limit_free)
+        if args.stage2_train_on_full_chat:
+            stage2_cmd.append("--stage2-train-on-full-chat")
+        else:
+            stage2_cmd.append("--no-stage2-train-on-full-chat")
+        if args.stage2_final_answer_only:
+            stage2_cmd.append("--stage2-final-answer-only")
+        else:
+            stage2_cmd.append("--no-stage2-final-answer-only")
+        if args.stage2_freeze_reasoning_style:
+            stage2_cmd.append("--stage2-freeze-reasoning-style")
+        else:
+            stage2_cmd.append("--no-stage2-freeze-reasoning-style")
+        stage2_cmd.extend(
+            [
+                "--stage2-holdout-fraction",
+                str(args.stage2_holdout_fraction),
+                "--stage2-holdout-seed",
+                str(args.stage2_holdout_seed),
+            ]
+        )
+        _append_optional(stage2_cmd, "--limit-mcq", _stage2_train_limit(args.limit_mcq))
+        _append_optional(stage2_cmd, "--limit-free", _stage2_train_limit(args.limit_free))
         print("Running Stage 2 adaptation command:")
         print(" ".join(stage2_cmd))
         subprocess.run(stage2_cmd, check=True)
+
+        if args.stage2_sanity_check:
+            sanity_input = _eval_input_for_stage2(stage2_root, "public")
+            sanity_cmd = [
+                sys.executable,
+                str(here / "sanity_check_stage_adapters.py"),
+                "--stage1-adapter-path",
+                str(stage1_adapter_path),
+                "--stage2-adapter-path",
+                str(stage2_adapter_path),
+                "--gpu-id",
+                args.gpu_id,
+                "--input",
+                sanity_input,
+            ]
+            _append_optional(sanity_cmd, "--vllm-quantization", args.vllm_quantization)
+            _append_optional(sanity_cmd, "--vllm-load-format", args.vllm_load_format)
+            print("Running Stage adapter sanity check:")
+            print(" ".join(sanity_cmd))
+            subprocess.run(sanity_cmd, check=True)
 
     if args.skip_infer:
         print("Training stages finished. Skipping inference stage by request.")
         return
 
     infer_adapter = stage2_adapter_path if not args.skip_stage2 else stage1_adapter_path
+
+    if args.verify_lora_before_infer:
+        verify_input = (
+            _eval_input_for_stage2(stage2_root, "public")
+            if not args.skip_stage2
+            else "public"
+        )
+        verify_cmd = [
+            sys.executable,
+            str(here / "verify_lora_vllm.py"),
+            "--lora-adapter-path",
+            str(infer_adapter),
+            "--gpu-id",
+            args.gpu_id,
+            "--input",
+            verify_input,
+        ]
+        _append_optional(verify_cmd, "--vllm-quantization", args.vllm_quantization)
+        _append_optional(verify_cmd, "--vllm-load-format", args.vllm_load_format)
+        print("Running LoRA verification:")
+        print(" ".join(verify_cmd))
+        subprocess.run(verify_cmd, check=True)
+
     infer_cmd = [
         sys.executable,
         str(here / "modular_pipeline.py"),
@@ -262,6 +430,8 @@ def main() -> None:
         str(infer_adapter),
     ]
     _append_optional(infer_cmd, "--output-dir", args.inference_output_dir)
+    _append_optional(infer_cmd, "--vllm-quantization", args.vllm_quantization)
+    _append_optional(infer_cmd, "--vllm-load-format", args.vllm_load_format)
 
     print("Running adapter-backed inference command:")
     print(" ".join(infer_cmd))

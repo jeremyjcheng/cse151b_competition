@@ -17,7 +17,13 @@ from transformers import (
     get_linear_schedule_with_warmup,
 )
 
-from cli_utils import apply_subset_caps, parse_train_args, resolve_input_path
+from cli_utils import (
+    apply_subset_caps,
+    parse_train_args,
+    resolve_input_path,
+    split_train_holdout,
+    write_jsonl,
+)
 from prompting import (
     build_adapt_train_free_user,
     build_adapt_train_mcq_user,
@@ -29,6 +35,7 @@ from settings import (
     MODEL_ID,
     REASONING_DEFAULT_LEARNING_RATE,
     REASONING_DEFAULT_MAX_STEPS,
+    STAGE2_DEFAULT_HOLDOUT_FRACTION,
 )
 from text_processing import ensure_boxed, extract_all_boxed, extract_boxed, extract_valid_letter
 
@@ -195,6 +202,11 @@ def _build_adapt_examples(
     limit_free: int | None,
     sample_seed: int,
     train_on_full_chat: bool,
+    final_answer_only: bool,
+    freeze_reasoning_style: bool,
+    holdout_fraction: float,
+    holdout_seed: int,
+    holdout_output_path: Path | None,
 ) -> list[dict]:
     raw_data = _load_jsonl(input_path)
     raw_data = apply_subset_caps(
@@ -207,14 +219,49 @@ def _build_adapt_examples(
     if not supervised:
         raise SystemExit("No supervised samples found. Training data must include `answer` fields.")
 
+    if holdout_fraction > 0:
+        train_supervised, holdout_supervised = split_train_holdout(
+            supervised,
+            holdout_fraction=holdout_fraction,
+            seed=holdout_seed,
+        )
+        if holdout_output_path is not None:
+            write_jsonl(holdout_output_path, holdout_supervised)
+            print(
+                f"Stage 2 holdout saved to {holdout_output_path} "
+                f"({len(holdout_supervised)} items). Do not train on this file."
+            )
+        print(
+            f"Stage 2 train/holdout split: {len(train_supervised)} train, "
+            f"{len(holdout_supervised)} holdout (fraction={holdout_fraction:.2f}, seed={holdout_seed})"
+        )
+        print(
+            "Use holdout (or a fresh public subset) for local scoring while tuning; "
+            "reserve full public scoring for rare final checks before private submit."
+        )
+        supervised = train_supervised
+
     examples: list[dict] = []
+    if freeze_reasoning_style:
+        # Conservative Stage-2 prompt: preserve Stage-1 reasoning ability and only adapt output format.
+        system_prompt = (
+            "You are solving competition math questions. "
+            "Keep reasoning style stable and avoid copying training-template wording. "
+            "End with exactly one final \\boxed{...}."
+        )
+    else:
+        system_prompt = (
+            "You are solving competition math questions. "
+            "Follow the required output format and end with exactly one final \\boxed{...}."
+        )
+
     for item in supervised:
         if item.get("options"):
             letter = _normalize_mcq_answer(item)
             if not letter:
                 continue
             target = f"\\boxed{{{letter}}}"
-            if train_on_full_chat:
+            if train_on_full_chat and not final_answer_only:
                 target = (
                     "Compute the answer and compare to options carefully.\n"
                     f"Final answer: \\boxed{{{letter}}}"
@@ -224,21 +271,22 @@ def _build_adapt_examples(
             target = _normalize_free_answer(item)
             if not target:
                 continue
-            if train_on_full_chat:
+            if train_on_full_chat and not final_answer_only:
                 target = (
                     "Solve the problem concisely and report only one final boxed answer.\n"
                     f"{target}"
                 )
             prompt = build_adapt_train_free_user(item["question"])
 
+        # Conservative default: Stage 2 supervises only final-answer formatting.
+        if final_answer_only:
+            target = _enforce_single_final_boxed("", fallback_answer=extract_boxed(target))
+
         examples.append(
             {
                 "prompt": prompt,
                 "target": _enforce_single_final_boxed(target),
-                "system_prompt": (
-                    "You are solving competition math questions. "
-                    "Follow the required output format and end with exactly one final \\boxed{...}."
-                ),
+                "system_prompt": system_prompt,
                 "source": "competition_adapt",
             }
         )
@@ -320,6 +368,19 @@ def _apply_stage_hparam_defaults(args) -> None:
             args.learning_rate = ADAPT_DEFAULT_LEARNING_RATE
         if args.max_steps == 500:
             args.max_steps = ADAPT_DEFAULT_MAX_STEPS
+        if args.stage2_holdout_fraction is None:
+            args.stage2_holdout_fraction = STAGE2_DEFAULT_HOLDOUT_FRACTION
+        if args.stage2_final_answer_only and args.train_on_full_chat:
+            print(
+                "Stage `adapt` uses --stage2-final-answer-only by default; "
+                "disabling --train-on-full-chat to reduce public-label memorization."
+            )
+            args.train_on_full_chat = False
+        if args.stage2_freeze_reasoning_style:
+            print(
+                "Stage `adapt` is in conservative mode: preserving Stage-1 reasoning "
+                "style while learning competition answer formatting."
+            )
 
 
 def main() -> None:
@@ -369,12 +430,18 @@ def main() -> None:
         if not input_path.exists():
             raise SystemExit(f"Input file not found: {input_path}")
         print(f"Loading competition adaptation data from {input_path}")
+        holdout_path = output_dir / "stage2_holdout.jsonl"
         all_examples = _build_adapt_examples(
             input_path,
             limit_mcq=args.limit_mcq,
             limit_free=args.limit_free,
             sample_seed=args.sample_seed,
             train_on_full_chat=args.train_on_full_chat,
+            final_answer_only=args.stage2_final_answer_only,
+            freeze_reasoning_style=args.stage2_freeze_reasoning_style,
+            holdout_fraction=float(args.stage2_holdout_fraction),
+            holdout_seed=args.stage2_holdout_seed,
+            holdout_output_path=holdout_path,
         )
         print(f"Adaptation examples: {len(all_examples)}")
 
@@ -503,7 +570,10 @@ def main() -> None:
             if global_step % 10 == 0:
                 avg_loss = running_loss / 10.0
                 lr_now = scheduler.get_last_lr()[0]
-                print(f"step={global_step} epoch={epoch} loss={avg_loss:.4f} lr={lr_now:.2e}")
+                msg = f"step={global_step} epoch={epoch} loss={avg_loss:.4f} lr={lr_now:.2e}"
+                # tqdm.write + flush so nohup logs show loss (plain print gets buffered/hidden).
+                pbar.write(msg)
+                print(msg, flush=True)
                 running_loss = 0.0
 
             if args.save_every_steps > 0 and global_step % args.save_every_steps == 0:
@@ -511,7 +581,8 @@ def main() -> None:
                 ckpt_dir.mkdir(parents=True, exist_ok=True)
                 model.save_pretrained(ckpt_dir)
                 tokenizer.save_pretrained(ckpt_dir)
-                print(f"Saved adapter checkpoint to {ckpt_dir}")
+                pbar.write(f"Saved adapter checkpoint to {ckpt_dir}")
+                print(f"Saved adapter checkpoint to {ckpt_dir}", flush=True)
 
             if global_step >= args.max_steps:
                 break

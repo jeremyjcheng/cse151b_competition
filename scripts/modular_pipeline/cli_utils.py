@@ -1,6 +1,7 @@
 """CLI parsing and run configuration helpers."""
 
 import argparse
+import json
 from pathlib import Path
 
 from settings import (
@@ -52,7 +53,23 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Optional local path to a trained LoRA adapter directory. "
-            "If provided, adapter weights are loaded on top of the base model."
+            "If provided, adapter weights are loaded via vLLM LoRA (enable_lora + LoRARequest)."
+        ),
+    )
+    parser.add_argument(
+        "--vllm-quantization",
+        default=None,
+        help=(
+            "Override vLLM quantization (default from settings: bitsandbytes). "
+            "Use 'none' to disable quantization for LoRA debugging."
+        ),
+    )
+    parser.add_argument(
+        "--vllm-load-format",
+        default=None,
+        help=(
+            "Override vLLM load_format (default from settings: bitsandbytes). "
+            "Use 'auto' with --vllm-quantization none for full-precision LoRA experiments."
         ),
     )
     parser.add_argument(
@@ -268,11 +285,49 @@ def parse_train_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--train-on-full-chat",
-        action="store_true",
+        "--stage2-train-on-full-chat",
+        dest="train_on_full_chat",
+        action=argparse.BooleanOptionalAction,
+        default=False,
         help=(
-            "If set, train on all assistant tokens in the completion. "
-            "By default only the final boxed target is supervised."
+            "If enabled, train on all assistant tokens in the completion. "
+            "Keep disabled for conservative Stage-2 adaptation to avoid style copying."
         ),
+    )
+    parser.add_argument(
+        "--stage2-final-answer-only",
+        dest="stage2_final_answer_only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Stage-2 only: supervise final boxed answers instead of long reasoning traces. "
+            "Recommended to reduce overfitting to public labels."
+        ),
+    )
+    parser.add_argument(
+        "--stage2-freeze-reasoning-style",
+        dest="stage2_freeze_reasoning_style",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Stage-2 only: keep adaptation focused on answer format and avoid re-teaching "
+            "reasoning style from small public data."
+        ),
+    )
+    parser.add_argument(
+        "--stage2-holdout-fraction",
+        type=float,
+        default=None,
+        help=(
+            "Stage-2 only: fraction of supervised public items reserved for eval (not trained on). "
+            "Use this so local public scoring reflects generalization, not memorization."
+        ),
+    )
+    parser.add_argument(
+        "--stage2-holdout-seed",
+        type=int,
+        default=0,
+        help="Seed for Stage-2 train/holdout split.",
     )
     parser.add_argument(
         "--resume-from-adapter",
@@ -298,6 +353,41 @@ def resolve_input_path(arg_value: str, root: Path) -> Path:
 
     path_value = Path(arg_value)
     return path_value if path_value.is_absolute() else (root / path_value)
+
+
+def split_train_holdout(
+    data: list[dict],
+    *,
+    holdout_fraction: float,
+    seed: int,
+) -> tuple[list[dict], list[dict]]:
+    """Deterministically split supervised items into train vs holdout eval sets."""
+    if not data:
+        return [], []
+    if holdout_fraction <= 0:
+        return data, []
+    if holdout_fraction >= 1:
+        return [], list(data)
+
+    import random as _random
+
+    rng = _random.Random(seed)
+    indices = list(range(len(data)))
+    rng.shuffle(indices)
+    n_holdout = max(1, int(round(len(data) * holdout_fraction)))
+    n_holdout = min(n_holdout, len(data) - 1)
+
+    holdout_set = set(indices[:n_holdout])
+    train = [data[i] for i in range(len(data)) if i not in holdout_set]
+    holdout = [data[i] for i in range(len(data)) if i in holdout_set]
+    return train, holdout
+
+
+def write_jsonl(path: Path, records: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for rec in records:
+            f.write(json.dumps(rec) + "\n")
 
 
 def apply_subset_caps(
