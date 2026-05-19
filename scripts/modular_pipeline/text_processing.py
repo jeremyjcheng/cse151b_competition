@@ -354,6 +354,28 @@ def truncate_after_last_boxed(response: str) -> str:
     return response[:last_end].rstrip()
 
 
+def truncate_after_first_valid_mcq_box(text: str, labels: list[str]) -> str:
+    """Trim ``text`` to end at the first ``\\boxed{...}`` whose inner value
+    resolves to a valid option letter.
+
+    Useful for the LoRA gate's MCQ safety rule: when a broken adapter emits
+    ``\\boxed{A} is the correct answer. \\boxed{A} is the correct...`` we
+    want diagnostics to look at the clean prefix up to the first valid
+    boxed letter, not the polluted tail.
+
+    Returns the original text unchanged if no boxed span maps to a valid
+    option letter.
+    """
+    valid_set_upper = {str(x).strip().upper() for x in (labels or [])}
+    if not valid_set_upper:
+        return text
+    for _start, end, inner in iter_boxed_spans(text):
+        letter = _mcq_letter_from_boxed_inner(inner, valid_set_upper)
+        if letter:
+            return text[:end].rstrip()
+    return text
+
+
 _FINAL_ANSWER_CUE_PATTERN = re.compile(
     r"(?:final\s+answer|therefore|thus|hence)\b",
     re.IGNORECASE,

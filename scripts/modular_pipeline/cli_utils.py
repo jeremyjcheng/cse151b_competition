@@ -11,6 +11,9 @@ from settings import (
     LORA_DROPOUT,
     LORA_R,
     LORA_TARGET_MODULES,
+    MAX_TOKENS_FREE,
+    MAX_TOKENS_MCQ,
+    MAX_TOKENS_MCQ_FINAL,
     MAX_SEQ_LEN,
     MAX_STEPS,
     SAVE_EVERY_STEPS,
@@ -138,6 +141,27 @@ def parse_args() -> argparse.Namespace:
             "If enabled (default), persist full raw model generations in JSONL "
             "outputs under the `raw` field. Disable with --no-save-raw-output."
         ),
+    )
+    parser.add_argument(
+        "--mcq-max-new-tokens",
+        type=int,
+        default=MAX_TOKENS_MCQ,
+        help=f"Max new tokens for MCQ primary generation. Default: {MAX_TOKENS_MCQ}.",
+    )
+    parser.add_argument(
+        "--mcq-final-max-new-tokens",
+        type=int,
+        default=MAX_TOKENS_MCQ_FINAL,
+        help=(
+            "Max new tokens for MCQ finalizer generation. "
+            f"Default: {MAX_TOKENS_MCQ_FINAL}."
+        ),
+    )
+    parser.add_argument(
+        "--free-max-new-tokens",
+        type=int,
+        default=MAX_TOKENS_FREE,
+        help=f"Max new tokens for free-form generation. Default: {MAX_TOKENS_FREE}.",
     )
     args = parser.parse_args()
     return apply_vllm_cli_overrides(args)

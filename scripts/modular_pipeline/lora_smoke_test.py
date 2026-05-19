@@ -62,13 +62,17 @@ def main() -> None:
         sys.path.insert(0, str(root))
 
     adapter = validate_lora_adapter_dir(args.lora_adapter_path)
-    vllm_quantization = None if args.no_bitsandbytes else "bitsandbytes"
+    vllm_quantization = "none" if args.no_bitsandbytes else "bitsandbytes"
     vllm_load_format = "auto" if args.no_bitsandbytes else "bitsandbytes"
+    enforce_eager = bool(args.vllm_enforce_eager)
 
     print(f"Recommended vLLM >= {VLLM_MIN_VERSION}")
-    print(f"Adapter: {adapter}")
-    print(f"quantization={vllm_quantization!r} load_format={vllm_load_format!r}")
-    print(f"max_new_tokens={args.max_new_tokens}")
+    print("[smoke] Effective config:")
+    print(f"  lora_adapter_path={adapter}")
+    print(f"  quantization={vllm_quantization!r}")
+    print(f"  load_format={vllm_load_format!r}")
+    print(f"  enforce_eager={enforce_eager}")
+    print(f"  max_new_tokens={args.max_new_tokens}")
 
     from model_pipeline import ModularPipeline
 
@@ -78,7 +82,7 @@ def main() -> None:
         lora_adapter_path=str(adapter),
         vllm_quantization=vllm_quantization,
         vllm_load_format=vllm_load_format,
-        enforce_eager=args.vllm_enforce_eager,
+        enforce_eager=enforce_eager,
     )
     print("[smoke] ModularPipeline ready.", flush=True)
 
@@ -96,11 +100,13 @@ def main() -> None:
 
     sampling = SamplingParams(max_tokens=args.max_new_tokens, temperature=0.0)
     gen_kwargs: dict = dict(sampling_params=sampling, use_tqdm=True)
-    if pipe._lora_request is not None:
-        gen_kwargs["lora_request"] = pipe._lora_request
+    lora_request_obj = getattr(pipe, "_lora_request_obj", None)
+    lora_active = getattr(pipe, "_lora_active", lora_request_obj is not None)
+    if lora_active and lora_request_obj is not None:
+        gen_kwargs["lora_request"] = lora_request_obj
 
     print("\n[smoke] BEFORE llm.generate (single prompt)", flush=True)
-    print(f"  lora_request={pipe._lora_request!r}", flush=True)
+    print(f"  lora_request={lora_request_obj!r} active={lora_active}", flush=True)
     outputs = pipe.llm.generate([chat], **gen_kwargs)
     print("[smoke] AFTER llm.generate", flush=True)
 

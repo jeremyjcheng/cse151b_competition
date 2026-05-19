@@ -102,12 +102,6 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--stage2-sanity-check",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Run a small base-vs-stage1-vs-stage2 sanity comparison after Stage 2.",
-    )
-    parser.add_argument(
         "--stage2-holdout-fraction",
         type=float,
         default=STAGE2_DEFAULT_HOLDOUT_FRACTION,
@@ -191,21 +185,14 @@ def parse_args() -> argparse.Namespace:
         help="Subset seed when using --limit-mcq/--limit-free.",
     )
     parser.add_argument(
-        "--verify-lora-before-infer",
-        action="store_true",
-        help=(
-            "Run verify_lora_vllm.py on the inference adapter before modular_pipeline.py."
-        ),
-    )
-    parser.add_argument(
         "--vllm-quantization",
         default=None,
-        help="Forwarded to inference / LoRA verify (use 'none' to disable BnB).",
+        help="Forwarded to inference (use 'none' to disable BnB).",
     )
     parser.add_argument(
         "--vllm-load-format",
         default=None,
-        help="Forwarded to inference / LoRA verify (e.g. auto with --vllm-quantization none).",
+        help="Forwarded to inference (e.g. auto with --vllm-quantization none).",
     )
     parser.add_argument(
         "--skip-infer",
@@ -240,21 +227,6 @@ def _stage2_train_limit(value: int | None) -> int | None:
     if value is None or value <= 0:
         return None
     return value
-
-
-def _eval_input_for_stage2(stage2_root: Path, fallback: str) -> str:
-    holdout_path = stage2_root / "stage2_holdout.jsonl"
-    if holdout_path.exists():
-        print(
-            f"Using Stage-2 holdout for local checks: {holdout_path} "
-            "(items never seen during Stage-2 training)."
-        )
-        return str(holdout_path)
-    print(
-        "Warning: stage2_holdout.jsonl not found; falling back to full public for local checks. "
-        "Prefer holdout scoring to avoid optimistic dev scores."
-    )
-    return fallback
 
 
 def main() -> None:
@@ -371,53 +343,11 @@ def main() -> None:
         print(" ".join(stage2_cmd))
         subprocess.run(stage2_cmd, check=True)
 
-        if args.stage2_sanity_check:
-            sanity_input = _eval_input_for_stage2(stage2_root, "public")
-            sanity_cmd = [
-                sys.executable,
-                str(here / "sanity_check_stage_adapters.py"),
-                "--stage1-adapter-path",
-                str(stage1_adapter_path),
-                "--stage2-adapter-path",
-                str(stage2_adapter_path),
-                "--gpu-id",
-                args.gpu_id,
-                "--input",
-                sanity_input,
-            ]
-            _append_optional(sanity_cmd, "--vllm-quantization", args.vllm_quantization)
-            _append_optional(sanity_cmd, "--vllm-load-format", args.vllm_load_format)
-            print("Running Stage adapter sanity check:")
-            print(" ".join(sanity_cmd))
-            subprocess.run(sanity_cmd, check=True)
-
     if args.skip_infer:
         print("Training stages finished. Skipping inference stage by request.")
         return
 
     infer_adapter = stage2_adapter_path if not args.skip_stage2 else stage1_adapter_path
-
-    if args.verify_lora_before_infer:
-        verify_input = (
-            _eval_input_for_stage2(stage2_root, "public")
-            if not args.skip_stage2
-            else "public"
-        )
-        verify_cmd = [
-            sys.executable,
-            str(here / "verify_lora_vllm.py"),
-            "--lora-adapter-path",
-            str(infer_adapter),
-            "--gpu-id",
-            args.gpu_id,
-            "--input",
-            verify_input,
-        ]
-        _append_optional(verify_cmd, "--vllm-quantization", args.vllm_quantization)
-        _append_optional(verify_cmd, "--vllm-load-format", args.vllm_load_format)
-        print("Running LoRA verification:")
-        print(" ".join(verify_cmd))
-        subprocess.run(verify_cmd, check=True)
 
     infer_cmd = [
         sys.executable,

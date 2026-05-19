@@ -125,6 +125,9 @@ def main() -> None:
             vllm_load_format=args.vllm_load_format,
             enforce_eager=True if args.vllm_enforce_eager else None,
             inference_backend=args.inference_backend,
+            mcq_max_new_tokens=args.mcq_max_new_tokens,
+            mcq_final_max_new_tokens=args.mcq_final_max_new_tokens,
+            free_max_new_tokens=args.free_max_new_tokens,
         )
         mcq_items = [item for item in remaining_data if item.get("options")]
         free_items = [item for item in remaining_data if not item.get("options")]

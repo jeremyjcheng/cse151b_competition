@@ -81,6 +81,8 @@ _TRAINING_ECHO_PATTERNS = (
     "\\begin{solution}",
 )
 
+_VLLM_ARG_UNSET = object()
+
 
 def _has_training_echo(text: str) -> bool:
     """Detect memorized training-template text from broken adapt LoRA outputs."""
@@ -128,6 +130,9 @@ class ModularPipeline:
         vllm_load_format: str | None = None,
         enforce_eager: bool | None = None,
         inference_backend: Literal["vllm", "peft"] = "vllm",
+        mcq_max_new_tokens: int | None = None,
+        mcq_final_max_new_tokens: int | None = None,
+        free_max_new_tokens: int | None = None,
     ):
         os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
 
@@ -136,6 +141,17 @@ class ModularPipeline:
         self._generate_call_count = 0
         self._peft_engine = None
         self.llm = None
+        self.mcq_max_new_tokens = (
+            MAX_TOKENS_MCQ if mcq_max_new_tokens is None else mcq_max_new_tokens
+        )
+        self.mcq_final_max_new_tokens = (
+            MAX_TOKENS_MCQ_FINAL
+            if mcq_final_max_new_tokens is None
+            else mcq_final_max_new_tokens
+        )
+        self.free_max_new_tokens = (
+            MAX_TOKENS_FREE if free_max_new_tokens is None else free_max_new_tokens
+        )
 
         resolved_adapter: Path | None = None
         if lora_adapter_path:
@@ -154,20 +170,35 @@ class ModularPipeline:
                 lora_adapter_path=self.lora_adapter_path,
             )
             self.tokenizer = self._peft_engine.tokenizer
-            self._lora_request = None
+            self._lora_request_obj = None
+            self._lora_active = False
             return
 
         check_vllm_version(VLLM_MIN_VERSION)
-        self.vllm_quantization = (
+        quantization_override = (
             normalize_vllm_optional(vllm_quantization)
             if vllm_quantization is not None
-            else VLLM_QUANTIZATION
+            else _VLLM_ARG_UNSET
         )
-        self.vllm_load_format = (
+        load_format_override = (
             normalize_vllm_optional(vllm_load_format)
             if vllm_load_format is not None
-            else VLLM_LOAD_FORMAT
+            else _VLLM_ARG_UNSET
         )
+
+        self.vllm_quantization = (
+            VLLM_QUANTIZATION
+            if quantization_override is _VLLM_ARG_UNSET
+            else quantization_override
+        )
+        self.vllm_load_format = (
+            VLLM_LOAD_FORMAT
+            if load_format_override is _VLLM_ARG_UNSET
+            else load_format_override
+        )
+
+        if self.vllm_quantization is None and load_format_override is _VLLM_ARG_UNSET:
+            self.vllm_load_format = "auto"
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_id,
@@ -205,14 +236,16 @@ class ModularPipeline:
             load_format=self.vllm_load_format,
         )
 
-        self._lora_request = None
+        self._lora_request_obj = None
+        self._lora_active = False
         self._max_lora_rank = VLLM_MAX_LORA_RANK
         if resolved_adapter is not None:
             self._max_lora_rank = resolve_max_lora_rank(resolved_adapter)
             llm_kwargs["enable_lora"] = True
             llm_kwargs["max_lora_rank"] = self._max_lora_rank
             llm_kwargs["max_loras"] = VLLM_MAX_LORAS
-            self._lora_request = LoRARequest("adapter", 1, str(resolved_adapter))
+            self._lora_request_obj = LoRARequest("adapter", 1, str(resolved_adapter))
+            self._lora_active = True
 
         eff_eager = llm_kwargs["enforce_eager"]
         print("Initializing vLLM with:")
@@ -225,6 +258,9 @@ class ModularPipeline:
         print(f"  max_num_batched_tokens={VLLM_MAX_NUM_BATCHED_TOKENS}")
         print(f"  quantization={self.vllm_quantization}")
         print(f"  load_format={self.vllm_load_format}")
+        print(f"  mcq_max_new_tokens={self.mcq_max_new_tokens}")
+        print(f"  mcq_final_max_new_tokens={self.mcq_final_max_new_tokens}")
+        print(f"  free_max_new_tokens={self.free_max_new_tokens}")
         if resolved_adapter is not None:
             print("  enable_lora=True")
             print(f"  max_lora_rank={self._max_lora_rank}")
@@ -234,6 +270,20 @@ class ModularPipeline:
                 "Qwen3ForCausalLM, or 'falling back to Transformers' — fallback can "
                 "mean LoRA is not applied natively."
             )
+            if not eff_eager and "qwen3" in model_id.lower():
+                try:
+                    from packaging.version import Version
+                    import vllm  # type: ignore
+
+                    installed = getattr(vllm, "__version__", "0.0.0")
+                    if Version(installed) < Version(VLLM_MIN_VERSION):
+                        print(
+                            "Warning: Qwen3 + LoRA + enforce_eager=False on vLLM "
+                            f"{installed} may hang on first generate. Try "
+                            "--vllm-enforce-eager or upgrade vLLM."
+                        )
+                except Exception:
+                    pass
 
         self.llm = LLM(**llm_kwargs)
         print(
@@ -242,6 +292,27 @@ class ModularPipeline:
             flush=True,
         )
         self._judger: Any = None
+
+    def set_lora_active(self, enabled: bool) -> None:
+        """Toggle the LoRA adapter for subsequent `generate` calls.
+
+        Used by the comparison runner to alternate between a "base" pass
+        (`enabled=False`) and a "lora" pass (`enabled=True`) on a single
+        engine. Default behaviour is unchanged: `enabled` is True whenever
+        an adapter was provided at init.
+
+        Raises
+        ------
+        RuntimeError
+            If `enabled=True` is requested but no adapter was loaded at
+            init time (there is nothing to activate).
+        """
+        if enabled and self._lora_request_obj is None:
+            raise RuntimeError(
+                "Cannot enable LoRA: no adapter was provided at "
+                "ModularPipeline init time."
+            )
+        self._lora_active = bool(enabled)
 
     def _get_judger(self):
         if self._judger is False:
@@ -477,8 +548,8 @@ class ModularPipeline:
                 )
             return results
 
-        if self._lora_request is not None:
-            llm_kwargs["lora_request"] = self._lora_request
+        if self._lora_active and self._lora_request_obj is not None:
+            llm_kwargs["lora_request"] = self._lora_request_obj
 
         self._generate_call_count += 1
         is_first_generate = self._generate_call_count == 1
@@ -488,12 +559,20 @@ class ModularPipeline:
                 f"(batch_size={len(chats)}, max_new_tokens={max_new_tokens})",
                 flush=True,
             )
+            lora_request_attached = (
+                self._lora_active and self._lora_request_obj is not None
+            )
             print(
-                f"[debug]   lora_enabled={self._lora_request is not None}",
+                f"[debug]   lora_enabled={lora_request_attached} "
+                f"(adapter_loaded={self._lora_request_obj is not None}, "
+                f"active={self._lora_active})",
                 flush=True,
             )
-            if self._lora_request is not None:
-                print(f"[debug]   lora_request={self._lora_request!r}", flush=True)
+            if lora_request_attached:
+                print(
+                    f"[debug]   lora_request={self._lora_request_obj!r}",
+                    flush=True,
+                )
             print(
                 f"[debug]   quantization={self.vllm_quantization!r} "
                 f"load_format={self.vllm_load_format!r}",
@@ -666,6 +745,11 @@ class ModularPipeline:
     def solve_mcq_batch(self, items: list[dict]) -> list[dict]:
         if not items:
             return []
+        print(
+            f"[debug] solve_mcq_batch: batch_size={len(items)} "
+            f"mcq_max_new_tokens={self.mcq_max_new_tokens}",
+            flush=True,
+        )
 
         user_prompts = [build_mcq_user(item["question"], item["options"]) for item in items]
         system_prompts = [SYSTEM_PROMPT_MCQ] * len(items)
@@ -678,7 +762,7 @@ class ModularPipeline:
         primary_outputs = self._generate_batch(
             system_prompts,
             user_prompts,
-            max_new_tokens=MAX_TOKENS_MCQ,
+            max_new_tokens=self.mcq_max_new_tokens,
             temperature=TEMP_MCQ,
             top_p=TOP_P_MCQ,
             top_k=TOP_K_MCQ,
@@ -770,6 +854,11 @@ class ModularPipeline:
                 finalizer_indices.append(idx)
 
         if finalizer_items:
+            print(
+                f"[debug] solve_mcq_batch: finalizer_items={len(finalizer_items)} "
+                f"mcq_final_max_new_tokens={self.mcq_final_max_new_tokens}",
+                flush=True,
+            )
             finalizer_system_prompts = [SYSTEM_PROMPT_MCQ] * len(finalizer_items)
 
             finalizer_user_prompts: list[str] = []
@@ -799,7 +888,7 @@ class ModularPipeline:
             finalizer_outputs = self._generate_batch(
                 finalizer_system_prompts,
                 finalizer_user_prompts,
-                max_new_tokens=MAX_TOKENS_MCQ_FINAL,
+                max_new_tokens=self.mcq_final_max_new_tokens,
                 temperature=0.0,
                 top_p=1.0,
                 top_k=0,
@@ -868,6 +957,11 @@ class ModularPipeline:
     def solve_free_batch(self, items: list[dict]) -> list[dict]:
         if not items:
             return []
+        print(
+            f"[debug] solve_free_batch: batch_size={len(items)} "
+            f"free_max_new_tokens={self.free_max_new_tokens}",
+            flush=True,
+        )
 
         user_prompts = [build_free_user(item["question"]) for item in items]
         system_prompts = [SYSTEM_PROMPT_FREE] * len(items)
@@ -875,7 +969,7 @@ class ModularPipeline:
         outputs = self._generate_batch(
             system_prompts,
             user_prompts,
-            max_new_tokens=MAX_TOKENS_FREE,
+            max_new_tokens=self.free_max_new_tokens,
             temperature=TEMP_FREE,
             top_p=TOP_P_FREE,
             top_k=TOP_K_FREE,
