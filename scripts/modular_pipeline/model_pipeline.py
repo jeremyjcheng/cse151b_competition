@@ -3,12 +3,18 @@
 Inference backend is vLLM instead of HuggingFace generate + LogitsProcessor.
 The pipeline keeps prompting and answer extraction mostly unchanged, but adds
 safer MCQ extraction and stronger finalizer recovery.
+
+LoRA debugging:
+  - First llm.generate() logs [debug] BEFORE/AFTER markers (see _generate_batch).
+  - Use lora_smoke_test.py for a single-prompt isolation run.
+  - Try --no-bitsandbytes or --inference-backend peft if vLLM LoRA hangs.
 """
 
 import os
 import re
+import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from transformers import AutoTokenizer
 
@@ -120,12 +126,38 @@ class ModularPipeline:
         lora_adapter_path: str | None = None,
         vllm_quantization: str | None = None,
         vllm_load_format: str | None = None,
+        enforce_eager: bool | None = None,
+        inference_backend: Literal["vllm", "peft"] = "vllm",
     ):
         os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
 
-        check_vllm_version(VLLM_MIN_VERSION)
-
         self.model_id = model_id
+        self.inference_backend = inference_backend
+        self._generate_call_count = 0
+        self._peft_engine = None
+        self.llm = None
+
+        resolved_adapter: Path | None = None
+        if lora_adapter_path:
+            resolved_adapter = validate_lora_adapter_dir(lora_adapter_path)
+        self.lora_adapter_path = str(resolved_adapter) if resolved_adapter else None
+
+        if inference_backend == "peft":
+            if resolved_adapter is None:
+                raise ValueError(
+                    "--inference-backend peft requires --lora-adapter-path"
+                )
+            from peft_inference import PeftGenerateEngine
+
+            self._peft_engine = PeftGenerateEngine(
+                model_id=model_id,
+                lora_adapter_path=self.lora_adapter_path,
+            )
+            self.tokenizer = self._peft_engine.tokenizer
+            self._lora_request = None
+            return
+
+        check_vllm_version(VLLM_MIN_VERSION)
         self.vllm_quantization = (
             normalize_vllm_optional(vllm_quantization)
             if vllm_quantization is not None
@@ -136,11 +168,6 @@ class ModularPipeline:
             if vllm_load_format is not None
             else VLLM_LOAD_FORMAT
         )
-
-        resolved_adapter: Path | None = None
-        if lora_adapter_path:
-            resolved_adapter = validate_lora_adapter_dir(lora_adapter_path)
-        self.lora_adapter_path = str(resolved_adapter) if resolved_adapter else None
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             model_id,
@@ -168,7 +195,9 @@ class ModularPipeline:
             trust_remote_code=True,
             max_num_seqs=VLLM_MAX_NUM_SEQS,
             max_num_batched_tokens=VLLM_MAX_NUM_BATCHED_TOKENS,
-            enforce_eager=VLLM_ENFORCE_EAGER,
+            enforce_eager=(
+                VLLM_ENFORCE_EAGER if enforce_eager is None else enforce_eager
+            ),
         )
         _apply_vllm_quantization_kwargs(
             llm_kwargs,
@@ -185,8 +214,9 @@ class ModularPipeline:
             llm_kwargs["max_loras"] = VLLM_MAX_LORAS
             self._lora_request = LoRARequest("adapter", 1, str(resolved_adapter))
 
+        eff_eager = llm_kwargs["enforce_eager"]
         print("Initializing vLLM with:")
-        print(f"  enforce_eager={VLLM_ENFORCE_EAGER}")
+        print(f"  enforce_eager={eff_eager}")
         print(f"  model_id={model_id}")
         print(f"  lora_adapter_path={self.lora_adapter_path}")
         print(f"  gpu_memory_utilization={VLLM_GPU_MEMORY_UTILIZATION}")
@@ -206,6 +236,11 @@ class ModularPipeline:
             )
 
         self.llm = LLM(**llm_kwargs)
+        print(
+            "vLLM engine ready. First generate() may spend time on torch.compile "
+            "(high CPU, 0% GPU is normal until it finishes).",
+            flush=True,
+        )
         self._judger: Any = None
 
     def _get_judger(self):
@@ -402,10 +437,78 @@ class ModularPipeline:
             use_tqdm=False,
         )
 
+        if self._peft_engine is not None:
+            completion_texts = self._peft_engine.generate_texts(
+                chats,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                repetition_penalty=repetition_penalty,
+                do_sample=do_sample,
+            )
+            results: list[dict] = []
+            for i, completion_text in enumerate(completion_texts):
+                raw_before_trunc = clean_special_tokens(completion_text).strip()
+                raw_clean = raw_before_trunc
+                if force_smart_boxed_stop:
+                    mcq_valid = mcq_valid_per_row[i] if mcq_valid_per_row is not None else None
+                    raw_clean = self._truncate_for_smart_boxed_stop(
+                        raw_clean=raw_clean,
+                        mcq_valid=mcq_valid,
+                        post_box_patience_tokens=post_box_patience_tokens,
+                    )
+                pre_trunc_tokens = len(
+                    self.tokenizer.encode(raw_before_trunc, add_special_tokens=False)
+                )
+                post_trunc_tokens = len(
+                    self.tokenizer.encode(raw_clean, add_special_tokens=False)
+                )
+                results.append(
+                    {
+                        "raw": raw_clean,
+                        "raw_before_trunc": raw_before_trunc,
+                        "n_tokens": int(post_trunc_tokens),
+                        "pre_trunc_n_tokens": int(pre_trunc_tokens),
+                        "generation_hit_max": bool(pre_trunc_tokens >= max_new_tokens),
+                        "raw_was_post_truncated": raw_clean.strip()
+                        != raw_before_trunc.strip(),
+                    }
+                )
+            return results
+
         if self._lora_request is not None:
             llm_kwargs["lora_request"] = self._lora_request
 
+        self._generate_call_count += 1
+        is_first_generate = self._generate_call_count == 1
+        if is_first_generate:
+            print(
+                f"[debug] BEFORE llm.generate #{self._generate_call_count} "
+                f"(batch_size={len(chats)}, max_new_tokens={max_new_tokens})",
+                flush=True,
+            )
+            print(
+                f"[debug]   lora_enabled={self._lora_request is not None}",
+                flush=True,
+            )
+            if self._lora_request is not None:
+                print(f"[debug]   lora_request={self._lora_request!r}", flush=True)
+            print(
+                f"[debug]   quantization={self.vllm_quantization!r} "
+                f"load_format={self.vllm_load_format!r}",
+                flush=True,
+            )
+            sys.stdout.flush()
+
         request_outputs = self.llm.generate(chats, **llm_kwargs)
+
+        if is_first_generate:
+            print(
+                f"[debug] AFTER llm.generate #{self._generate_call_count}",
+                flush=True,
+            )
+            sys.stdout.flush()
 
         results: list[dict] = []
         for i, req_out in enumerate(request_outputs):

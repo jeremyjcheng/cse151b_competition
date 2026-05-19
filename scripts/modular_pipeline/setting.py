@@ -13,6 +13,9 @@ VLLM_MAX_NUM_BATCHED_TOKENS = 4096
 VLLM_QUANTIZATION = "bitsandbytes"
 VLLM_LOAD_FORMAT = "bitsandbytes"
 
+# LoRA note: bitsandbytes + vLLM LoRA can hang on first generate in vLLM < 0.10.
+# Debug with: --no-bitsandbytes, lora_smoke_test.py, or --inference-backend peft.
+
 # Avoid CUDA graph capture OOM during sanity checks / small inference runs.
 VLLM_ENFORCE_EAGER = False
 

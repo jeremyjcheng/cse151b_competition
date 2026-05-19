@@ -17,7 +17,7 @@ import json
 import sys
 from pathlib import Path
 
-from cli_utils import resolve_input_path
+from cli_utils import apply_vllm_cli_overrides, resolve_input_path
 from lora_vllm_utils import validate_lora_adapter_dir
 from model_pipeline import ModularPipeline
 from prompting import build_free_user, build_mcq_user
@@ -62,7 +62,19 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional vLLM load_format override.",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--no-bitsandbytes",
+        action="store_true",
+        help="Disable bitsandbytes quantization for LoRA debugging.",
+    )
+    parser.add_argument(
+        "--dtype",
+        choices=("bfloat16", "float16"),
+        default=None,
+        help="Full-precision load (implies --no-bitsandbytes).",
+    )
+    args = parser.parse_args()
+    return apply_vllm_cli_overrides(args)
 
 
 def _pick_samples(data: list[dict]) -> list[tuple[str, dict]]:

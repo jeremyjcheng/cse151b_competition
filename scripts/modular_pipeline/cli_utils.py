@@ -73,6 +73,40 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--no-bitsandbytes",
+        action="store_true",
+        help=(
+            "Disable vLLM bitsandbytes quantization (sets quantization=none, "
+            "load_format=auto). Use when LoRA + bitsandbytes hangs on first generate."
+        ),
+    )
+    parser.add_argument(
+        "--dtype",
+        choices=("bfloat16", "float16"),
+        default=None,
+        help=(
+            "Load base weights in full precision (implies --no-bitsandbytes). "
+            "Use bfloat16 for LoRA debugging on Ampere+ GPUs."
+        ),
+    )
+    parser.add_argument(
+        "--vllm-enforce-eager",
+        action="store_true",
+        help=(
+            "Set vLLM enforce_eager=True (skip CUDA graphs; can avoid hangs during "
+            "first LoRA generate / torch.compile)."
+        ),
+    )
+    parser.add_argument(
+        "--inference-backend",
+        choices=("vllm", "peft"),
+        default="vllm",
+        help=(
+            "Inference engine. Default vllm. Use peft for Transformers+PEFT LoRA "
+            "when vLLM LoRA is unstable (requires --lora-adapter-path)."
+        ),
+    )
+    parser.add_argument(
         "--limit-mcq",
         type=int,
         default=None,
@@ -105,7 +139,18 @@ def parse_args() -> argparse.Namespace:
             "outputs under the `raw` field. Disable with --no-save-raw-output."
         ),
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    return apply_vllm_cli_overrides(args)
+
+
+def apply_vllm_cli_overrides(args: argparse.Namespace) -> argparse.Namespace:
+    """Apply convenience flags that override vLLM quantization/load_format."""
+    if getattr(args, "no_bitsandbytes", False) or getattr(args, "dtype", None):
+        args.vllm_quantization = "none"
+        args.vllm_load_format = "auto"
+        label = "no-bitsandbytes" if args.no_bitsandbytes else f"dtype={args.dtype}"
+        print(f"vLLM: using full-precision load ({label})")
+    return args
 
 
 def parse_train_args() -> argparse.Namespace:

@@ -123,6 +123,8 @@ def main() -> None:
             lora_adapter_path=args.lora_adapter_path,
             vllm_quantization=args.vllm_quantization,
             vllm_load_format=args.vllm_load_format,
+            enforce_eager=True if args.vllm_enforce_eager else None,
+            inference_backend=args.inference_backend,
         )
         mcq_items = [item for item in remaining_data if item.get("options")]
         free_items = [item for item in remaining_data if not item.get("options")]
