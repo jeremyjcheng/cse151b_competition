@@ -14,7 +14,7 @@ VLLM_QUANTIZATION = "bitsandbytes"
 VLLM_LOAD_FORMAT = "bitsandbytes"
 
 # Avoid CUDA graph capture OOM during sanity checks / small inference runs.
-VLLM_ENFORCE_EAGER = True
+VLLM_ENFORCE_EAGER = False
 
 # vLLM LoRA: max_loras caps concurrent adapters; max_lora_rank is set after LORA_R below.
 VLLM_MAX_LORAS = 1
