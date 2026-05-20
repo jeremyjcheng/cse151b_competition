@@ -411,7 +411,29 @@ def parse_train_args() -> argparse.Namespace:
         action="store_true",
         help="If set, also save a merged full model checkpoint (large).",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--target-module-set",
+        choices=("full", "attention"),
+        default=None,
+        help=(
+            "Convenience preset for --lora-target-modules. "
+            "'full' = q/k/v/o_proj + gate/up/down_proj (current default). "
+            "'attention' = q/k/v/o_proj only (recommended for Stage-2 "
+            "format adapters to avoid MLP-driven behaviour drift)."
+        ),
+    )
+
+    args = parser.parse_args()
+
+    if args.target_module_set == "attention":
+        args.lora_target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
+    elif args.target_module_set == "full":
+        args.lora_target_modules = [
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "gate_proj", "up_proj", "down_proj",
+        ]
+
+    return args
 
 
 def resolve_input_path(arg_value: str, root: Path) -> Path:

@@ -161,6 +161,24 @@ def _parse_args() -> argparse.Namespace:
         default=2.0,
         help="Per-item judger timeout when --only-base-fails is set.",
     )
+    parser.add_argument(
+        "--output-mcq-path",
+        default=None,
+        help=(
+            "Also write MCQ-only cleaned items to this path. "
+            "Compatible with --mcq-only/--free-only (writes the MCQ subset "
+            "of whatever passes the main filter)."
+        ),
+    )
+    parser.add_argument(
+        "--output-free-path",
+        default=None,
+        help=(
+            "Also write free-only cleaned items to this path. "
+            "Compatible with --mcq-only/--free-only (writes the free subset "
+            "of whatever passes the main filter)."
+        ),
+    )
     args = parser.parse_args()
     if args.mcq_only and args.free_only:
         parser.error("--mcq-only and --free-only are mutually exclusive.")
@@ -340,6 +358,16 @@ def main() -> None:
 
     _write_jsonl(output_path, kept)
 
+    mcq_kept = [it for it in kept if it.get("options")]
+    free_kept = [it for it in kept if not it.get("options")]
+
+    if args.output_mcq_path:
+        mcq_path = Path(args.output_mcq_path)
+        _write_jsonl(mcq_path, mcq_kept)
+    if args.output_free_path:
+        free_path = Path(args.output_free_path)
+        _write_jsonl(free_path, free_kept)
+
     n_total = len(items)
     n_kept = len(kept)
     n_dropped = n_total - n_kept - skipped_by_type - skipped_base_passed
@@ -347,6 +375,12 @@ def main() -> None:
     print("=" * 60)
     print(f"Source:      {input_path} (n={n_total})")
     print(f"Output:      {output_path} (n={n_kept})")
+    print(f"  MCQ:       {len(mcq_kept)}")
+    print(f"  Free-form: {len(free_kept)}")
+    if args.output_mcq_path:
+        print(f"MCQ split:   {args.output_mcq_path} (n={len(mcq_kept)})")
+    if args.output_free_path:
+        print(f"Free split:  {args.output_free_path} (n={len(free_kept)})")
     print(f"Type filter: skipped {skipped_by_type} items by --mcq-only/--free-only")
     if base_fail_ids is not None:
         print(
