@@ -120,11 +120,13 @@ class ModularPipeline:
         lora_adapter_path: str | None = None,
         vllm_quantization: str | None = None,
         vllm_load_format: str | None = None,
+        enforce_eager: bool | None = None,
     ):
         os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
 
-        check_vllm_version(VLLM_MIN_VERSION)
+        check_vllm_version(VLLM_MIN_VERSION, strict=True)
 
+        self.enforce_eager = VLLM_ENFORCE_EAGER if enforce_eager is None else enforce_eager
         self.model_id = model_id
         self.vllm_quantization = (
             normalize_vllm_optional(vllm_quantization)
@@ -168,7 +170,7 @@ class ModularPipeline:
             trust_remote_code=True,
             max_num_seqs=VLLM_MAX_NUM_SEQS,
             max_num_batched_tokens=VLLM_MAX_NUM_BATCHED_TOKENS,
-            enforce_eager=VLLM_ENFORCE_EAGER,
+            enforce_eager=self.enforce_eager,
         )
         _apply_vllm_quantization_kwargs(
             llm_kwargs,
@@ -185,8 +187,10 @@ class ModularPipeline:
             llm_kwargs["max_loras"] = VLLM_MAX_LORAS
             self._lora_request = LoRARequest("adapter", 1, str(resolved_adapter))
 
+        attn_backend = os.environ.get("VLLM_ATTENTION_BACKEND", "(default)")
         print("Initializing vLLM with:")
-        print(f"  enforce_eager={VLLM_ENFORCE_EAGER}")
+        print(f"  enforce_eager={self.enforce_eager}")
+        print(f"  attention_backend={attn_backend}")
         print(f"  model_id={model_id}")
         print(f"  lora_adapter_path={self.lora_adapter_path}")
         print(f"  gpu_memory_utilization={VLLM_GPU_MEMORY_UTILIZATION}")

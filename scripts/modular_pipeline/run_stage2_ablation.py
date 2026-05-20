@@ -58,6 +58,24 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print commands only; do not train.",
     )
+    p.add_argument(
+        "--eval-after-train",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run eval_runner.py on each run's stage2_holdout.jsonl after training.",
+    )
+    p.add_argument(
+        "--holdout-path",
+        default=None,
+        help="Override holdout JSONL path (default: <run>/stage2_holdout.jsonl).",
+    )
+    p.add_argument("--vllm-quantization", default=None)
+    p.add_argument("--vllm-load-format", default=None)
+    p.add_argument(
+        "--enforce-eager",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     return p.parse_args()
 
 
@@ -137,8 +155,46 @@ def main() -> None:
             continue
         subprocess.run(entry["command"], check=True)
 
+        if args.eval_after_train:
+            out_dir = Path(entry["output_dir"])
+            holdout = (
+                Path(args.holdout_path).resolve()
+                if args.holdout_path
+                else out_dir / "stage2_holdout.jsonl"
+            )
+            adapter = out_dir / "final_adapter"
+            if holdout.is_file() and adapter.is_dir():
+                eval_cmd = [
+                    sys.executable,
+                    str(here / "eval_runner.py"),
+                    "--input",
+                    str(holdout),
+                    "--lora-adapter-path",
+                    str(adapter),
+                    "--split-name",
+                    "val",
+                    "--gpu-id",
+                    args.gpu_id,
+                    "--eval-report",
+                    str(out_dir / "holdout_eval.json"),
+                ]
+                if args.vllm_quantization:
+                    eval_cmd.extend(["--vllm-quantization", args.vllm_quantization])
+                if args.vllm_load_format:
+                    eval_cmd.extend(["--vllm-load-format", args.vllm_load_format])
+                if args.enforce_eager is not None:
+                    flag = "--enforce-eager" if args.enforce_eager else "--no-enforce-eager"
+                    eval_cmd.append(flag)
+                print("Running holdout eval:", " ".join(eval_cmd))
+                subprocess.run(eval_cmd, check=False)
+            else:
+                print(f"Skipping eval for {entry['suffix']}: missing holdout or adapter.")
+
     print("\nDone. Compare adapters under:", adapter_root)
-    print("Inference: modular_pipeline.py --lora-adapter-path <run>/final_adapter")
+    print(
+        "Checkpoint sweep: python eval_runner.py --input <holdout> "
+        "--checkpoint-dir <adapter_root>"
+    )
 
 
 if __name__ == "__main__":

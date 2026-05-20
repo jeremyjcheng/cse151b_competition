@@ -2,8 +2,10 @@
 
 import argparse
 import json
+import re
 from pathlib import Path
 
+from lora_vllm_utils import validate_lora_adapter_dir
 from settings import (
     GRAD_ACCUM_STEPS,
     LEARNING_RATE,
@@ -15,6 +17,7 @@ from settings import (
     MAX_STEPS,
     SAVE_EVERY_STEPS,
     TRAIN_BATCH_SIZE,
+    VLLM_ENFORCE_EAGER,
     WARMUP_RATIO,
     WEIGHT_DECAY,
 )
@@ -105,7 +108,107 @@ def parse_args() -> argparse.Namespace:
             "outputs under the `raw` field. Disable with --no-save-raw-output."
         ),
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--enforce-eager",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Override vLLM enforce_eager (CUDA graphs disabled when True). "
+            f"Default from settings: {VLLM_ENFORCE_EAGER}."
+        ),
+    )
+    args = parser.parse_args()
+    if args.enforce_eager is None:
+        args.enforce_eager = VLLM_ENFORCE_EAGER
+    return args
+
+
+def parse_eval_args() -> argparse.Namespace:
+    """CLI for eval_runner.py (inference + metrics JSON + checkpoint sweep)."""
+    parser = argparse.ArgumentParser(
+        description="Run inference and write evaluation metrics with latency.",
+    )
+    parser.add_argument(
+        "--input",
+        default="public",
+        help="'public', 'private', 'holdout' (alias for stage2_holdout.jsonl path), or .jsonl path.",
+    )
+    parser.add_argument(
+        "--split-name",
+        default=None,
+        choices=("train", "val", "test"),
+        help="Metadata label for eval reports: train, val, or test.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Directory for eval JSON/CSV outputs. Default: <project>/results",
+    )
+    parser.add_argument(
+        "--eval-report",
+        default=None,
+        help="Path for combined eval JSON report (default: results/eval_<split>_<ts>.json).",
+    )
+    parser.add_argument(
+        "--checkpoint-dir",
+        default=None,
+        help=(
+            "If set, evaluate every checkpoint-step-* and final_adapter under this "
+            "directory and write a leaderboard CSV."
+        ),
+    )
+    parser.add_argument("--gpu-id", default="0")
+    parser.add_argument("--lora-adapter-path", default=None)
+    parser.add_argument("--vllm-quantization", default=None)
+    parser.add_argument("--vllm-load-format", default=None)
+    parser.add_argument(
+        "--enforce-eager",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=f"Override vLLM enforce_eager. Default from settings: {VLLM_ENFORCE_EAGER}.",
+    )
+    parser.add_argument("--limit-mcq", type=int, default=None)
+    parser.add_argument("--limit-free", type=int, default=None)
+    parser.add_argument("--sample-seed", type=int, default=0)
+    parser.add_argument(
+        "--save-raw-output",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Include raw generations in per-item records (eval_runner only).",
+    )
+    args = parser.parse_args()
+    if args.enforce_eager is None:
+        args.enforce_eager = VLLM_ENFORCE_EAGER
+    return args
+
+
+def discover_adapter_checkpoints(adapter_root: Path) -> list[Path]:
+    """Return sorted checkpoint-step-* dirs plus final_adapter when present."""
+    adapter_root = adapter_root.resolve()
+    if not adapter_root.is_dir():
+        raise FileNotFoundError(f"Checkpoint directory not found: {adapter_root}")
+
+    step_dirs: list[tuple[int, Path]] = []
+    for path in adapter_root.iterdir():
+        if not path.is_dir():
+            continue
+        match = re.fullmatch(r"checkpoint-step-(\d+)", path.name)
+        if match:
+            try:
+                validate_lora_adapter_dir(path)
+            except FileNotFoundError:
+                continue
+            step_dirs.append((int(match.group(1)), path))
+
+    ordered = [p for _, p in sorted(step_dirs, key=lambda x: x[0])]
+    final = adapter_root / "final_adapter"
+    if final.is_dir():
+        try:
+            validate_lora_adapter_dir(final)
+            ordered.append(final)
+        except FileNotFoundError:
+            pass
+    return ordered
 
 
 def parse_train_args() -> argparse.Namespace:
@@ -342,6 +445,26 @@ def parse_train_args() -> argparse.Namespace:
         action="store_true",
         help="If set, also save a merged full model checkpoint (large).",
     )
+    parser.add_argument(
+        "--curated-input",
+        default=None,
+        help="Optional JSONL of curated hard examples (overrides default adapt sampling).",
+    )
+    parser.add_argument(
+        "--val-eval-every-steps",
+        type=int,
+        default=0,
+        help=(
+            "If > 0, run lightweight holdout eval every N optimizer steps "
+            "(requires stage2_holdout.jsonl in output-dir)."
+        ),
+    )
+    parser.add_argument(
+        "--val-eval-max-items",
+        type=int,
+        default=30,
+        help="Max holdout items for periodic validation during training.",
+    )
     return parser.parse_args()
 
 
@@ -350,6 +473,13 @@ def resolve_input_path(arg_value: str, root: Path) -> Path:
         return root / "data" / "private.jsonl"
     if arg_value == "public":
         return root / "data" / "public.jsonl"
+    if arg_value == "holdout":
+        holdout = root / "workspaces" / "stage2" / "stage2_holdout.jsonl"
+        if holdout.is_file():
+            return holdout
+        raise FileNotFoundError(
+            f"Holdout not found at {holdout}. Train Stage 2 first or pass a .jsonl path."
+        )
 
     path_value = Path(arg_value)
     return path_value if path_value.is_absolute() else (root / path_value)

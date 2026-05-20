@@ -26,6 +26,7 @@ from settings import (
     MAX_TOKENS_MCQ,
     SYSTEM_PROMPT_FREE,
     SYSTEM_PROMPT_MCQ,
+    VLLM_ENFORCE_EAGER,
     VLLM_MIN_VERSION,
 )
 
@@ -61,6 +62,12 @@ def parse_args() -> argparse.Namespace:
         "--vllm-load-format",
         default=None,
         help="Optional vLLM load_format override.",
+    )
+    parser.add_argument(
+        "--enforce-eager",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override vLLM enforce_eager (False enables CUDA graphs).",
     )
     return parser.parse_args()
 
@@ -147,11 +154,14 @@ def main() -> None:
     print(f"Adapter: {adapter_path}")
     print(f"Recommended vLLM >= {VLLM_MIN_VERSION}")
 
+    enforce_eager = VLLM_ENFORCE_EAGER if args.enforce_eager is None else args.enforce_eager
     vllm_kwargs = dict(
         gpu_id=args.gpu_id,
         vllm_quantization=args.vllm_quantization,
         vllm_load_format=args.vllm_load_format,
+        enforce_eager=enforce_eager,
     )
+    print(f"enforce_eager={enforce_eager}")
 
     base_outputs: dict[str, str] = {}
     print("\n=== Base model (no LoRA) ===")

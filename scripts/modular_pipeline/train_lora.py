@@ -4,6 +4,7 @@ import json
 import os
 import random
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -207,21 +208,17 @@ def _build_adapt_examples(
     holdout_fraction: float,
     holdout_seed: int,
     holdout_output_path: Path | None,
+    curated_input_path: Path | None = None,
 ) -> list[dict]:
     raw_data = _load_jsonl(input_path)
-    raw_data = apply_subset_caps(
-        raw_data,
-        limit_mcq=limit_mcq,
-        limit_free=limit_free,
-        seed=sample_seed,
-    )
-    supervised = [item for item in raw_data if item.get("answer") is not None]
-    if not supervised:
+    supervised_full = [item for item in raw_data if item.get("answer") is not None]
+    if not supervised_full:
         raise SystemExit("No supervised samples found. Training data must include `answer` fields.")
 
+    holdout_supervised: list[dict] = []
     if holdout_fraction > 0:
         train_supervised, holdout_supervised = split_train_holdout(
-            supervised,
+            supervised_full,
             holdout_fraction=holdout_fraction,
             seed=holdout_seed,
         )
@@ -235,11 +232,27 @@ def _build_adapt_examples(
             f"Stage 2 train/holdout split: {len(train_supervised)} train, "
             f"{len(holdout_supervised)} holdout (fraction={holdout_fraction:.2f}, seed={holdout_seed})"
         )
-        print(
-            "Use holdout (or a fresh public subset) for local scoring while tuning; "
-            "reserve full public scoring for rare final checks before private submit."
-        )
         supervised = train_supervised
+    else:
+        supervised = supervised_full
+
+    if curated_input_path is not None:
+        if not curated_input_path.exists():
+            raise SystemExit(f"Curated input not found: {curated_input_path}")
+        curated = [item for item in _load_jsonl(curated_input_path) if item.get("answer") is not None]
+        holdout_ids = {item.get("id") for item in holdout_supervised}
+        curated = [item for item in curated if item.get("id") not in holdout_ids]
+        if not curated:
+            raise SystemExit(f"No curated training items after excluding holdout ids: {curated_input_path}")
+        supervised = curated
+        print(f"Using {len(supervised)} curated hard examples from {curated_input_path}")
+    else:
+        supervised = apply_subset_caps(
+            supervised,
+            limit_mcq=limit_mcq,
+            limit_free=limit_free,
+            seed=sample_seed,
+        )
 
     examples: list[dict] = []
     if freeze_reasoning_style:
@@ -431,6 +444,11 @@ def main() -> None:
             raise SystemExit(f"Input file not found: {input_path}")
         print(f"Loading competition adaptation data from {input_path}")
         holdout_path = output_dir / "stage2_holdout.jsonl"
+        curated_path = None
+        if args.curated_input:
+            curated_path = Path(args.curated_input)
+            if not curated_path.is_absolute():
+                curated_path = root / curated_path
         all_examples = _build_adapt_examples(
             input_path,
             limit_mcq=args.limit_mcq,
@@ -442,6 +460,7 @@ def main() -> None:
             holdout_fraction=float(args.stage2_holdout_fraction),
             holdout_seed=args.stage2_holdout_seed,
             holdout_output_path=holdout_path,
+            curated_input_path=curated_path,
         )
         print(f"Adaptation examples: {len(all_examples)}")
 
@@ -547,6 +566,36 @@ def main() -> None:
     running_loss = 0.0
     epoch = 0
 
+    def _maybe_run_holdout_eval(adapter_dir: Path, step: int) -> None:
+        if args.val_eval_every_steps <= 0 or args.stage != "adapt":
+            return
+        holdout_file = output_dir / "stage2_holdout.jsonl"
+        if not holdout_file.is_file():
+            return
+        eval_script = here / "eval_runner.py"
+        report_path = output_dir / f"val_eval_step_{step}.json"
+        cmd = [
+            sys.executable,
+            str(eval_script),
+            "--input",
+            str(holdout_file),
+            "--lora-adapter-path",
+            str(adapter_dir),
+            "--split-name",
+            "val",
+            "--gpu-id",
+            args.gpu_id,
+            "--eval-report",
+            str(report_path),
+            "--limit-mcq",
+            str(min(15, args.val_eval_max_items)),
+            "--limit-free",
+            str(min(15, args.val_eval_max_items)),
+            "--no-save-raw-output",
+        ]
+        print(f"Running holdout validation eval (step {step}): {' '.join(cmd)}")
+        subprocess.run(cmd, check=False)
+
     pbar = tqdm(total=args.max_steps, desc=f"LoRA training ({args.stage})")
     while global_step < args.max_steps:
         epoch += 1
@@ -583,6 +632,8 @@ def main() -> None:
                 tokenizer.save_pretrained(ckpt_dir)
                 pbar.write(f"Saved adapter checkpoint to {ckpt_dir}")
                 print(f"Saved adapter checkpoint to {ckpt_dir}", flush=True)
+                if args.val_eval_every_steps > 0 and global_step % args.val_eval_every_steps == 0:
+                    _maybe_run_holdout_eval(ckpt_dir, global_step)
 
             if global_step >= args.max_steps:
                 break
@@ -593,6 +644,8 @@ def main() -> None:
     model.save_pretrained(final_adapter_dir)
     tokenizer.save_pretrained(final_adapter_dir)
     print(f"Saved final adapter to {final_adapter_dir}")
+    if args.val_eval_every_steps > 0 and args.stage == "adapt":
+        _maybe_run_holdout_eval(final_adapter_dir, global_step)
 
     if args.save_final_merged:
         merged_dir = output_dir / "merged_model"

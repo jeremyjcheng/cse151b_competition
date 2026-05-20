@@ -117,12 +117,19 @@ def main() -> None:
     remaining_data = [item for item in data if item.get("id") not in done_ids]
     print(f"Remaining questions to solve: {len(remaining_data)}")
 
+    enforce_eager = args.enforce_eager
+    if enforce_eager is None:
+        from settings import VLLM_ENFORCE_EAGER
+
+        enforce_eager = VLLM_ENFORCE_EAGER
+
     if remaining_data:
         pipe = ModularPipeline(
             gpu_id=args.gpu_id,
             lora_adapter_path=args.lora_adapter_path,
             vllm_quantization=args.vllm_quantization,
             vllm_load_format=args.vllm_load_format,
+            enforce_eager=enforce_eager,
         )
         mcq_items = [item for item in remaining_data if item.get("options")]
         free_items = [item for item in remaining_data if not item.get("options")]

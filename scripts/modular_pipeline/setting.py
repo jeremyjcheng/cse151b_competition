@@ -78,8 +78,8 @@ STAGE2_TRAIN_LIMIT_FREE = 25
 # MCQ generation settings
 # ============================================================
 
-# Room to finish reasoning and emit a final \\boxed{X} (truncation hurts correctness).
-MAX_TOKENS_MCQ = 4096
+# Shorter MCQ budget: deterministic \\boxed{X} answers (less truncation risk, faster).
+MAX_TOKENS_MCQ = 1024
 
 # Ignored by vLLM backend, kept for compatibility with older HF path.
 THINK_BUDGET_MCQ = 0
@@ -146,7 +146,7 @@ FREE_BATCH_SIZE = 2
 # Thinking mode toggles
 # ============================================================
 
-ENABLE_THINKING_MCQ_PRIMARY = True
+ENABLE_THINKING_MCQ_PRIMARY = False
 ENABLE_THINKING_MCQ_FINAL = False
 ENABLE_THINKING_FREE = True
 
@@ -155,12 +155,11 @@ ENABLE_THINKING_FREE = True
 # ============================================================
 
 SYSTEM_PROMPT_MCQ = (
-    "You are solving a multiple-choice math problem. "
-    "You may think step by step, but the final line must be exactly one "
-    "boxed option letter from the listed choices, like \\boxed{A}. "
-    "Do not box numbers or expressions. "
-    "Do not output more than one \\boxed{...}. "
-    "Stop immediately after that final box."
+    "You solve multiple-choice math problems. "
+    "The final line must be exactly one letter from the listed choices as \\boxed{X}. "
+    "Do not box numbers or option text. "
+    "Output only one \\boxed{...}. "
+    "Stop immediately after that line."
 )
 
 SYSTEM_PROMPT_FREE = (
@@ -174,12 +173,4 @@ SYSTEM_PROMPT_FREE = (
     "After the final boxed answer, stop."
 )
 
-MCQ_FEWSHOT = (
-    "Example:\n"
-    "Q: What is 2+3?\n"
-    "A. 4\n"
-    "B. 5\n"
-    "C. 6\n"
-    "D. 7\n\n"
-    "\\boxed{B}\n\n"
-)
+MCQ_FEWSHOT = ""

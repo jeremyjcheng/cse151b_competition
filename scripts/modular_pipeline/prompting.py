@@ -1,22 +1,10 @@
 """Prompt construction helpers."""
 
-from settings import MCQ_FEWSHOT
 
 
 def build_mcq_user(question: str, options: list[str]) -> str:
-    labels = [chr(65 + i) for i in range(len(options))]
-    valid_letters = ", ".join(labels)
-    opts_text = "\n".join(f"{lbl}. {str(opt).strip()}" for lbl, opt in zip(labels, options))
-
-    return (
-        f"{MCQ_FEWSHOT}"
-        f"Q: {question}\n\n"
-        f"Options:\n{opts_text}\n\n"
-        f"Valid choices: [{valid_letters}].\n"
-        "Choose the single best option and output exactly one final line as \\boxed{X}, "
-        "where X is one valid choice letter. If uncertain, output your best guess from "
-        "valid choices. Do not include explanation text, and do not output multiple boxed answers."
-    )
+    """Inference MCQ prompt aligned with adapt-training format."""
+    return build_adapt_train_mcq_user(question, options)
 
 
 def count_ans_slots(question: str) -> int:

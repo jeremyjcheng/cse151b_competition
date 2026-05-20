@@ -412,3 +412,95 @@ def mcq_canonical_response(letter: str) -> str:
     """Single MCQ submission line: exactly \\boxed{X}."""
     ch = str(letter).strip().upper()
     return f"\\boxed{{{ch}}}" if ch else "\\boxed{}"
+
+
+_TRAINING_ECHO_PATTERNS = (
+    "Solve this problem concisely",
+    "Solve the problem concisely",
+    "report only one final boxed answer",
+    "\\begin{solution}",
+)
+
+
+def has_training_echo(text: str) -> bool:
+    """Detect memorized training-template text from broken adapt LoRA outputs."""
+    head = text[:500]
+    return any(pattern in head for pattern in _TRAINING_ECHO_PATTERNS)
+
+
+def _strip_training_echo_prefix(text: str) -> str:
+    """Drop a memorized training header when present."""
+    if not has_training_echo(text):
+        return text
+    for marker in ("\\boxed{", "Q:", "Options:"):
+        pos = text.find(marker)
+        if pos > 0:
+            return text[pos:].lstrip()
+    return text
+
+
+def extract_last_valid_letter(text: str, labels: list[str]) -> str:
+    """Return the last valid boxed MCQ letter in text."""
+    valid = {str(label).strip().upper() for label in labels}
+    candidates: list[str] = []
+    for _start, _end, inner in iter_boxed_spans(text):
+        cand = _mcq_letter_from_boxed_inner(inner, valid)
+        if cand:
+            candidates.append(cand)
+    return candidates[-1] if candidates else ""
+
+
+def extract_submission(
+    raw_text: str,
+    item: dict,
+    *,
+    prior_meta: dict | None = None,
+) -> tuple[str, dict]:
+    """Unified answer extraction for inference and evaluation.
+
+    Returns (submission_response, meta) where submission_response is the string
+    sent to the judger / written to CSV.
+    """
+    meta: dict = dict(prior_meta or {})
+    text = clean_special_tokens(str(raw_text or ""))
+    if has_training_echo(text):
+        text = _strip_training_echo_prefix(text)
+        meta["training_echo_stripped"] = True
+
+    is_mcq = bool(item.get("options"))
+    options = item.get("options") or []
+    labels = [chr(65 + i) for i in range(len(options))]
+
+    boxed_values = extract_all_boxed(text)
+    meta["boxed_count_in_raw"] = len(boxed_values)
+
+    if is_mcq:
+        letter = ""
+        extractor_path = "mcq_missing_box"
+
+        if len(boxed_values) > 1:
+            letter = extract_last_valid_letter(text, labels)
+            extractor_path = "mcq_multi_box_last"
+        elif boxed_values:
+            letter = extract_valid_letter(text, labels)
+            extractor_path = "mcq_single_box" if letter else "mcq_invalid_box"
+        if not letter:
+            letter = extract_tail_mcq_letter(text, labels)
+            if letter:
+                extractor_path = "mcq_tail_phrase"
+        if not letter:
+            visible = visible_answer_after_think_tags(text)
+            letter = extract_valid_letter(visible, labels)
+            if letter:
+                extractor_path = "mcq_phrase_visible"
+
+        meta["extractor_path"] = extractor_path
+        meta["extracted_letter"] = letter
+        meta["malformed_output"] = not bool(letter)
+        meta["malformed_reason"] = "" if letter else extractor_path
+        response = mcq_canonical_response(letter)
+        return response, meta
+
+    response, free_meta = canonicalize_free_response_with_meta(text)
+    meta.update(free_meta)
+    return response, meta

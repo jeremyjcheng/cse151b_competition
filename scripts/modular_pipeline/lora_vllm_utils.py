@@ -67,8 +67,8 @@ def resolve_max_lora_rank(adapter_dir: Path | None = None) -> int:
     return max(floor, adapter_rank)
 
 
-def check_vllm_version(min_version: str) -> None:
-    """Warn when installed vLLM is below the recommended minimum for Qwen3 LoRA."""
+def check_vllm_version(min_version: str, *, strict: bool = False) -> None:
+    """Warn or raise when installed vLLM is below the recommended minimum for Qwen3 LoRA."""
     try:
         from packaging.version import Version
     except ImportError:
@@ -77,11 +77,18 @@ def check_vllm_version(min_version: str) -> None:
     try:
         import vllm  # type: ignore
     except ImportError:
+        if strict:
+            raise RuntimeError(
+                f"vLLM is not installed. Install vLLM>={min_version} for native Qwen3 LoRA."
+            )
         return
 
     installed = getattr(vllm, "__version__", "0.0.0")
     if Version(installed) < Version(min_version):
-        print(
-            f"Warning: vLLM {installed} is below recommended {min_version} for Qwen3 LoRA. "
-            "Upgrade vLLM if LoRA appears ignored or you see Transformers fallback logs."
+        msg = (
+            f"vLLM {installed} is below recommended {min_version} for Qwen3 LoRA. "
+            "Upgrade with: pip install 'vllm>=0.10.0'"
         )
+        if strict:
+            raise RuntimeError(msg)
+        print(f"Warning: {msg}")

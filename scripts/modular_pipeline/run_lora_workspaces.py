@@ -191,11 +191,23 @@ def parse_args() -> argparse.Namespace:
         help="Subset seed when using --limit-mcq/--limit-free.",
     )
     parser.add_argument(
+        "--eval-after-stage2",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run eval_runner.py on stage2_holdout.jsonl after Stage 2 training.",
+    )
+    parser.add_argument(
         "--verify-lora-before-infer",
         action="store_true",
         help=(
             "Run verify_lora_vllm.py on the inference adapter before modular_pipeline.py."
         ),
+    )
+    parser.add_argument(
+        "--enforce-eager",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override vLLM enforce_eager for verify/inference/eval stages.",
     )
     parser.add_argument(
         "--vllm-quantization",
@@ -233,6 +245,11 @@ def parse_args() -> argparse.Namespace:
 def _append_optional(cmd: list[str], flag: str, value) -> None:
     if value is not None:
         cmd.extend([flag, str(value)])
+
+
+def _append_enforce_eager(cmd: list[str], args: argparse.Namespace) -> None:
+    if args.enforce_eager is not None:
+        cmd.append("--enforce-eager" if args.enforce_eager else "--no-enforce-eager")
 
 
 def _stage2_train_limit(value: int | None) -> int | None:
@@ -371,6 +388,53 @@ def main() -> None:
         print(" ".join(stage2_cmd))
         subprocess.run(stage2_cmd, check=True)
 
+        if args.eval_after_stage2:
+            holdout_path = stage2_root / "stage2_holdout.jsonl"
+            if holdout_path.is_file() and stage2_adapter_path.is_dir():
+                eval_cmd = [
+                    sys.executable,
+                    str(here / "eval_runner.py"),
+                    "--input",
+                    str(holdout_path),
+                    "--lora-adapter-path",
+                    str(stage2_adapter_path),
+                    "--split-name",
+                    "val",
+                    "--gpu-id",
+                    args.gpu_id,
+                    "--eval-report",
+                    str(stage2_root / "holdout_eval_final.json"),
+                ]
+                _append_optional(eval_cmd, "--vllm-quantization", args.vllm_quantization)
+                _append_optional(eval_cmd, "--vllm-load-format", args.vllm_load_format)
+                _append_enforce_eager(eval_cmd, args)
+                print("Running post-Stage-2 holdout eval:")
+                print(" ".join(eval_cmd))
+                subprocess.run(eval_cmd, check=False)
+
+                sweep_cmd = [
+                    sys.executable,
+                    str(here / "eval_runner.py"),
+                    "--input",
+                    str(holdout_path),
+                    "--checkpoint-dir",
+                    str(stage2_root),
+                    "--split-name",
+                    "val",
+                    "--gpu-id",
+                    args.gpu_id,
+                    "--eval-report",
+                    str(stage2_root / "holdout_checkpoint_sweep.json"),
+                ]
+                _append_optional(sweep_cmd, "--vllm-quantization", args.vllm_quantization)
+                _append_optional(sweep_cmd, "--vllm-load-format", args.vllm_load_format)
+                _append_enforce_eager(sweep_cmd, args)
+                print("Running checkpoint sweep on holdout:")
+                print(" ".join(sweep_cmd))
+                subprocess.run(sweep_cmd, check=False)
+            else:
+                print("Skipping post-Stage-2 eval: holdout or final_adapter missing.")
+
         if args.stage2_sanity_check:
             sanity_input = _eval_input_for_stage2(stage2_root, "public")
             sanity_cmd = [
@@ -387,6 +451,7 @@ def main() -> None:
             ]
             _append_optional(sanity_cmd, "--vllm-quantization", args.vllm_quantization)
             _append_optional(sanity_cmd, "--vllm-load-format", args.vllm_load_format)
+            _append_enforce_eager(sanity_cmd, args)
             print("Running Stage adapter sanity check:")
             print(" ".join(sanity_cmd))
             subprocess.run(sanity_cmd, check=True)
@@ -415,6 +480,7 @@ def main() -> None:
         ]
         _append_optional(verify_cmd, "--vllm-quantization", args.vllm_quantization)
         _append_optional(verify_cmd, "--vllm-load-format", args.vllm_load_format)
+        _append_enforce_eager(verify_cmd, args)
         print("Running LoRA verification:")
         print(" ".join(verify_cmd))
         subprocess.run(verify_cmd, check=True)
@@ -432,6 +498,7 @@ def main() -> None:
     _append_optional(infer_cmd, "--output-dir", args.inference_output_dir)
     _append_optional(infer_cmd, "--vllm-quantization", args.vllm_quantization)
     _append_optional(infer_cmd, "--vllm-load-format", args.vllm_load_format)
+    _append_enforce_eager(infer_cmd, args)
 
     print("Running adapter-backed inference command:")
     print(" ".join(infer_cmd))
