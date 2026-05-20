@@ -183,11 +183,13 @@ def parse_train_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--stage",
-        choices=("reasoning", "adapt"),
+        choices=("reasoning", "adapt", "mcq", "mixed_reasoning_mcq"),
         default="adapt",
         help=(
             "Training stage. `reasoning` trains on public reasoning datasets; "
-            "`adapt` lightly adapts formatting on competition data."
+            "`adapt` lightly adapts formatting on competition data; "
+            "`mcq` trains MCQ-focused adapter data; "
+            "`mixed_reasoning_mcq` mixes FRQ reasoning + MCQ data."
         ),
     )
     parser.add_argument(
@@ -335,6 +337,61 @@ def parse_train_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Optional cap for Hendrycks examples in stage `reasoning`.",
+    )
+    parser.add_argument(
+        "--include-math-mc",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Include XiangPan/math-mc in MCQ-capable stages (opt-in).",
+    )
+    parser.add_argument(
+        "--include-compmath-mcq",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Include biancaraimondi/CompMath-MCQ in MCQ-capable stages (opt-in).",
+    )
+    parser.add_argument(
+        "--max-math-mc-examples",
+        type=int,
+        default=None,
+        help="Optional cap for math-mc examples.",
+    )
+    parser.add_argument(
+        "--max-compmath-mcq-examples",
+        type=int,
+        default=None,
+        help="Optional cap for CompMath-MCQ examples.",
+    )
+    parser.add_argument(
+        "--mcq-example-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "Relative weight for MCQ examples in mixed training. "
+            "1.0 keeps natural counts; >1 upsamples MCQ; <1 downsamples MCQ."
+        ),
+    )
+    parser.add_argument(
+        "--print-dataset-samples",
+        action="store_true",
+        help="Print 3-5 formatted samples from each enabled dataset before training.",
+    )
+    parser.add_argument(
+        "--include-base-replay",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Include base replay examples from a prior output JSONL.",
+    )
+    parser.add_argument(
+        "--base-replay-path",
+        default=None,
+        help="Path to base model output JSONL used for replay filtering.",
+    )
+    parser.add_argument(
+        "--max-base-replay-examples",
+        type=int,
+        default=None,
+        help="Optional cap for accepted base replay examples.",
     )
     parser.add_argument(
         "--hendrycks-configs",

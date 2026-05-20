@@ -1,10 +1,12 @@
 """Custom LoRA fine-tuning entrypoint for the modular pipeline."""
 
 import json
+import math
 import os
 import random
 import re
 import sys
+from collections import Counter
 from pathlib import Path
 
 import torch
@@ -58,6 +60,135 @@ def _sample_cap(items: list[dict], max_items: int | None, seed: int) -> list[dic
     rng = random.Random(seed)
     picked = sorted(rng.sample(range(len(items)), max_items))
     return [items[i] for i in picked]
+
+
+def _new_dataset_stats(name: str) -> dict:
+    return {
+        "name": name,
+        "loaded": 0,
+        "accepted": 0,
+        "skipped": 0,
+        "skip_reasons": Counter(),
+        "schema": {},
+    }
+
+
+def _skip(stats: dict, reason: str) -> None:
+    stats["skipped"] += 1
+    stats["skip_reasons"][reason] += 1
+
+
+def _finalize_stats(stats: dict, accepted: int) -> dict:
+    stats["accepted"] = accepted
+    stats["skip_reasons"] = dict(stats["skip_reasons"])
+    return stats
+
+
+def _print_dataset_schema(name: str, split: str, ds, first_row: dict | None) -> dict:
+    features = getattr(ds, "features", None)
+    if hasattr(features, "keys"):
+        feature_keys = list(features.keys())
+        feature_types = {k: str(features[k]) for k in feature_keys}
+    elif isinstance(features, dict):
+        feature_keys = list(features.keys())
+        feature_types = {k: str(v) for k, v in features.items()}
+    else:
+        feature_keys = []
+        feature_types = {}
+    first_keys = sorted(list(first_row.keys())) if first_row else []
+    schema = {
+        "split": split,
+        "row_count": len(ds),
+        "feature_keys": feature_keys,
+        "feature_types": feature_types,
+        "first_row_keys": first_keys,
+    }
+    print(
+        f"[{name}] schema split={split} rows={len(ds)} "
+        f"features={feature_keys} first_row_keys={first_keys}"
+    )
+    return schema
+
+
+def _build_strict_mcq_prompt(question: str, options: list[str]) -> str:
+    labels = [chr(65 + i) for i in range(len(options))]
+    opts_text = "\n".join(f"{lbl}. {opt}" for lbl, opt in zip(labels, options))
+    return (
+        f"Question:\n{question}\n\n"
+        f"Options:\n{opts_text}\n\n"
+        "Think briefly and choose the correct option. End with exactly one boxed letter."
+    )
+
+
+def _normalize_options(raw_options) -> list[str]:
+    if not isinstance(raw_options, (list, tuple)):
+        return []
+    out = [str(x).strip() for x in raw_options if str(x).strip()]
+    return out
+
+
+def _safe_map_answer_to_letter(
+    answer_value,
+    *,
+    options: list[str],
+) -> tuple[str, str]:
+    labels = [chr(65 + i) for i in range(len(options))]
+    if not labels:
+        return "", "missing_options"
+    if answer_value is None:
+        return "", "missing_answer"
+
+    if isinstance(answer_value, bool):
+        return "", "ambiguous_bool_answer"
+
+    if isinstance(answer_value, (int, float)):
+        idx = int(answer_value)
+        if 0 <= idx < len(options):
+            return labels[idx], ""
+        return "", "answer_index_out_of_range"
+
+    answer_text = str(answer_value).strip()
+    if not answer_text:
+        return "", "empty_answer"
+
+    if answer_text.isdigit():
+        idx = int(answer_text)
+        if 0 <= idx < len(options):
+            return labels[idx], ""
+        return "", "answer_index_out_of_range"
+
+    letter = extract_valid_letter(answer_text, labels)
+    if letter:
+        return letter, ""
+
+    exact_matches = [
+        i
+        for i, opt in enumerate(options)
+        if answer_text.lower() == str(opt).strip().lower()
+    ]
+    if len(exact_matches) == 1:
+        return labels[exact_matches[0]], ""
+    if len(exact_matches) > 1:
+        return "", "ambiguous_answer_text_duplicate_choice"
+
+    return "", "answer_unmapped"
+
+
+def _is_strict_single_boxed_letter_target(target: str, letter: str) -> bool:
+    text = str(target).strip()
+    boxed = extract_all_boxed(text)
+    if len(boxed) != 1:
+        return False
+    if boxed[0].strip().upper() != letter.upper():
+        return False
+    return bool(re.fullmatch(rf"\\boxed\{{{re.escape(letter.upper())}\}}", text))
+
+
+def _top_reasons(skip_reasons: dict, max_items: int = 5) -> str:
+    if not skip_reasons:
+        return "none"
+    ranked = sorted(skip_reasons.items(), key=lambda kv: (-kv[1], kv[0]))
+    return ", ".join(f"{k}={v}" for k, v in ranked[:max_items])
 
 
 def _strip_boxed(text: str) -> str:
@@ -122,7 +253,7 @@ def _normalize_free_answer(item: dict) -> str:
     return _enforce_single_final_boxed("", fallback_answer=answer_text)
 
 
-def _load_openmath_examples(max_examples: int | None, seed: int) -> list[dict]:
+def _load_openmath_examples(max_examples: int | None, seed: int) -> tuple[list[dict], dict]:
     try:
         from datasets import load_dataset
     except Exception as exc:
@@ -131,7 +262,10 @@ def _load_openmath_examples(max_examples: int | None, seed: int) -> list[dict]:
         ) from exc
 
     ds = load_dataset("unsloth/OpenMathReasoning-mini", split="cot")
+    stats = _new_dataset_stats("openmath")
+    stats["schema"] = _print_dataset_schema("openmath", "cot", ds, dict(ds[0]) if len(ds) else None)
     rows = [dict(row) for row in ds]
+    stats["loaded"] = len(rows)
     rows = _sample_cap(rows, max_examples, seed)
     examples: list[dict] = []
     for row in rows:
@@ -139,12 +273,14 @@ def _load_openmath_examples(max_examples: int | None, seed: int) -> list[dict]:
         solution = str(row.get("generated_solution", "")).strip()
         expected = str(row.get("expected_answer", "")).strip()
         if not problem or not solution:
+            _skip(stats, "missing_problem_or_solution")
             continue
         target = _enforce_single_final_boxed(solution, fallback_answer=expected)
         examples.append(
             {
                 "prompt": build_reasoning_train_user(problem),
                 "target": target,
+                "example_type": "frq",
                 "system_prompt": (
                     "You are an expert competition mathematician. "
                     "Provide concise step-by-step reasoning and finish with exactly one final \\boxed{...}."
@@ -152,14 +288,14 @@ def _load_openmath_examples(max_examples: int | None, seed: int) -> list[dict]:
                 "source": "openmath",
             }
         )
-    return examples
+    return examples, _finalize_stats(stats, len(examples))
 
 
 def _load_hendrycks_examples(
     configs: list[str],
     max_examples: int | None,
     seed: int,
-) -> list[dict]:
+) -> tuple[list[dict], dict]:
     try:
         from datasets import load_dataset
     except Exception as exc:
@@ -168,23 +304,33 @@ def _load_hendrycks_examples(
         ) from exc
 
     merged: list[dict] = []
+    stats = _new_dataset_stats("hendrycks")
+    first_schema_printed = False
     for cfg in configs:
         ds = load_dataset("EleutherAI/hendrycks_math", cfg, split="train")
+        if not first_schema_printed:
+            stats["schema"] = _print_dataset_schema(
+                "hendrycks", f"{cfg}:train", ds, dict(ds[0]) if len(ds) else None
+            )
+            first_schema_printed = True
         for row in ds:
             merged.append(dict(row))
 
+    stats["loaded"] = len(merged)
     merged = _sample_cap(merged, max_examples, seed)
     examples: list[dict] = []
     for row in merged:
         problem = str(row.get("problem", "")).strip()
         solution = str(row.get("solution", "")).strip()
         if not problem or not solution:
+            _skip(stats, "missing_problem_or_solution")
             continue
         target = _enforce_single_final_boxed(solution)
         examples.append(
             {
                 "prompt": build_reasoning_train_user(problem),
                 "target": target,
+                "example_type": "frq",
                 "system_prompt": (
                     "You are an expert competition mathematician. "
                     "Provide concise step-by-step reasoning and finish with exactly one final \\boxed{...}."
@@ -192,7 +338,309 @@ def _load_hendrycks_examples(
                 "source": "hendrycks",
             }
         )
-    return examples
+    return examples, _finalize_stats(stats, len(examples))
+
+
+def _extract_options_from_row(row: dict) -> list[str]:
+    candidates = [
+        row.get("options"),
+        row.get("choices"),
+        row.get("answer_choices"),
+    ]
+    for cand in candidates:
+        opts = _normalize_options(cand)
+        if opts:
+            return opts
+
+    letter_keys = [k for k in ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J"] if row.get(k) is not None]
+    if letter_keys:
+        return [str(row[k]).strip() for k in letter_keys if str(row[k]).strip()]
+    return []
+
+
+def _extract_question_from_row(row: dict) -> str:
+    for key in ("question", "problem", "prompt", "query"):
+        value = row.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
+def _extract_answer_from_row(row: dict):
+    for key in ("answer", "Answer", "label", "correct_label", "target", "correct_answer"):
+        if key in row and row.get(key) is not None:
+            return row.get(key)
+    return None
+
+
+def _load_math_mc_examples(max_examples: int | None, seed: int) -> tuple[list[dict], dict]:
+    try:
+        from datasets import load_dataset
+    except Exception as exc:
+        raise RuntimeError(
+            "MCQ stages require `datasets`. Install with `pip install datasets`."
+        ) from exc
+
+    ds = load_dataset("XiangPan/math-mc", split="train")
+    stats = _new_dataset_stats("math_mc")
+    stats["schema"] = _print_dataset_schema("math_mc", "train", ds, dict(ds[0]) if len(ds) else None)
+    rows = [dict(row) for row in ds]
+    stats["loaded"] = len(rows)
+    rows = _sample_cap(rows, max_examples, seed)
+
+    examples: list[dict] = []
+    for row in rows:
+        question = _extract_question_from_row(row)
+        options = _extract_options_from_row(row)
+        answer_value = _extract_answer_from_row(row)
+
+        if not question:
+            _skip(stats, "missing_question")
+            continue
+        if len(options) < 2:
+            _skip(stats, "missing_or_short_options")
+            continue
+        if len(set(opt.lower() for opt in options)) != len(options):
+            _skip(stats, "duplicate_options")
+            continue
+
+        letter, reason = _safe_map_answer_to_letter(answer_value, options=options)
+        if not letter:
+            _skip(stats, reason or "unmapped_answer")
+            continue
+
+        target = f"\\boxed{{{letter}}}"
+        if not _is_strict_single_boxed_letter_target(target, letter):
+            _skip(stats, "invalid_mcq_target_shape")
+            continue
+
+        examples.append(
+            {
+                "prompt": _build_strict_mcq_prompt(question, options),
+                "target": target,
+                "example_type": "mcq",
+                "answer_letter": letter,
+                "system_prompt": (
+                    "You are solving a multiple-choice math question. "
+                    "Reason briefly and end with exactly one final boxed option letter."
+                ),
+                "source": "math_mc",
+            }
+        )
+
+    if stats["loaded"] > 0 and not examples:
+        raise SystemExit(
+            "math-mc schema detected but no rows could be safely mapped. "
+            f"features={stats['schema'].get('feature_keys')} "
+            f"first_row_keys={stats['schema'].get('first_row_keys')} "
+            f"top_skip_reasons={_top_reasons(dict(stats['skip_reasons']))}"
+        )
+    return examples, _finalize_stats(stats, len(examples))
+
+
+def _load_compmath_mcq_examples(max_examples: int | None, seed: int) -> tuple[list[dict], dict]:
+    try:
+        from datasets import load_dataset
+    except Exception as exc:
+        raise RuntimeError(
+            "MCQ stages require `datasets`. Install with `pip install datasets`."
+        ) from exc
+
+    ds = load_dataset("biancaraimondi/CompMath-MCQ", split="test")
+    stats = _new_dataset_stats("compmath_mcq")
+    stats["schema"] = _print_dataset_schema(
+        "compmath_mcq", "test", ds, dict(ds[0]) if len(ds) else None
+    )
+    rows = [dict(row) for row in ds]
+    stats["loaded"] = len(rows)
+    rows = _sample_cap(rows, max_examples, seed)
+
+    examples: list[dict] = []
+    for row in rows:
+        question = str(row.get("question", "")).strip()
+        options = _normalize_options(row.get("options"))
+        answer_value = row.get("correct_label", None)
+
+        if not question:
+            _skip(stats, "missing_question")
+            continue
+        if len(options) < 2:
+            _skip(stats, "missing_or_short_options")
+            continue
+        if len(set(opt.lower() for opt in options)) != len(options):
+            _skip(stats, "duplicate_options")
+            continue
+
+        letter, reason = _safe_map_answer_to_letter(answer_value, options=options)
+        if not letter:
+            _skip(stats, reason or "unmapped_answer")
+            continue
+
+        target = f"\\boxed{{{letter}}}"
+        if not _is_strict_single_boxed_letter_target(target, letter):
+            _skip(stats, "invalid_mcq_target_shape")
+            continue
+
+        examples.append(
+            {
+                "prompt": _build_strict_mcq_prompt(question, options),
+                "target": target,
+                "example_type": "mcq",
+                "answer_letter": letter,
+                "system_prompt": (
+                    "You are solving a multiple-choice math question. "
+                    "Reason briefly and end with exactly one final boxed option letter."
+                ),
+                "source": "compmath_mcq",
+            }
+        )
+
+    if stats["loaded"] > 0 and not examples:
+        raise SystemExit(
+            "CompMath-MCQ schema detected but no rows could be safely mapped. "
+            f"features={stats['schema'].get('feature_keys')} "
+            f"first_row_keys={stats['schema'].get('first_row_keys')} "
+            f"top_skip_reasons={_top_reasons(dict(stats['skip_reasons']))}"
+        )
+    return examples, _finalize_stats(stats, len(examples))
+
+
+def _load_reference_questions_by_id(root: Path) -> dict:
+    out = {}
+    for split_name in ("public", "private"):
+        path = root / "data" / f"{split_name}.jsonl"
+        if not path.exists():
+            continue
+        try:
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    row = json.loads(line)
+                    qid = row.get("id")
+                    if qid is not None:
+                        out[qid] = row
+        except Exception:
+            continue
+    return out
+
+
+def _load_base_replay_examples(
+    *,
+    replay_path: Path,
+    root: Path,
+    max_examples: int | None,
+    seed: int,
+) -> tuple[list[dict], dict]:
+    if not replay_path.exists():
+        raise SystemExit(f"--base-replay-path not found: {replay_path}")
+
+    stats = _new_dataset_stats("base_replay")
+    reference = _load_reference_questions_by_id(root)
+    rows = _load_jsonl(replay_path)
+    stats["loaded"] = len(rows)
+    stats["schema"] = {
+        "path": str(replay_path),
+        "row_count": len(rows),
+        "first_row_keys": sorted(list(rows[0].keys())) if rows else [],
+    }
+    if not rows:
+        return [], _finalize_stats(stats, 0)
+    if "response" not in rows[0]:
+        raise SystemExit(
+            f"Replay file schema incompatible: expected key `response`, got keys={stats['schema']['first_row_keys']}"
+        )
+
+    rows = _sample_cap(rows, max_examples, seed)
+    examples: list[dict] = []
+    for row in rows:
+        response = str(row.get("response", "")).strip()
+        meta = row.get("meta") or {}
+        if not response:
+            _skip(stats, "missing_response")
+            continue
+
+        if any(k in row for k in ("base_correct", "deploy_correct", "is_correct", "correct")):
+            is_correct = bool(
+                row.get("base_correct", row.get("deploy_correct", row.get("is_correct", row.get("correct"))))
+            )
+            if not is_correct:
+                _skip(stats, "marked_incorrect")
+                continue
+        else:
+            boxed = extract_all_boxed(response)
+            if not boxed:
+                _skip(stats, "clean_filter_missing_box")
+                continue
+            if any(not str(x).strip() for x in boxed):
+                _skip(stats, "clean_filter_empty_boxed")
+                continue
+            if len(boxed) > 1:
+                _skip(stats, "clean_filter_multiple_boxed")
+                continue
+            if meta.get("malformed_output"):
+                _skip(stats, "clean_filter_malformed")
+                continue
+            if meta.get("generation_hit_max"):
+                _skip(stats, "clean_filter_truncated")
+                continue
+            if meta.get("guessed_letter_used"):
+                _skip(stats, "clean_filter_guessed_letter")
+                continue
+            if meta.get("fallback_used"):
+                _skip(stats, "clean_filter_fallback")
+                continue
+
+        qid = row.get("id")
+        ref_item = reference.get(qid, {})
+        question = str(row.get("question") or ref_item.get("question") or "").strip()
+        options = row.get("options")
+        if options is None:
+            options = ref_item.get("options")
+        options = _normalize_options(options)
+        is_mcq = bool(row.get("is_mcq", bool(options)))
+        if not question:
+            _skip(stats, "missing_question_for_replay")
+            continue
+
+        if is_mcq:
+            if len(options) < 2:
+                _skip(stats, "missing_options_for_replay_mcq")
+                continue
+            labels = [chr(65 + i) for i in range(len(options))]
+            letter = extract_valid_letter(response, labels)
+            if not letter:
+                _skip(stats, "invalid_replay_mcq_letter")
+                continue
+            target = f"\\boxed{{{letter}}}"
+            if not _is_strict_single_boxed_letter_target(target, letter):
+                _skip(stats, "invalid_replay_mcq_target_shape")
+                continue
+            prompt = _build_strict_mcq_prompt(question, options)
+            example_type = "mcq"
+        else:
+            boxed = extract_boxed(response).strip()
+            if not boxed:
+                _skip(stats, "invalid_replay_frq_boxed")
+                continue
+            target = _enforce_single_final_boxed("", fallback_answer=boxed)
+            prompt = build_adapt_train_free_user(question)
+            example_type = "frq"
+
+        examples.append(
+            {
+                "prompt": prompt,
+                "target": target,
+                "example_type": example_type,
+                "system_prompt": (
+                    "You are solving competition math questions. "
+                    "Preserve stable behavior and finish with exactly one final \\boxed{...}."
+                ),
+                "source": "base_replay",
+            }
+        )
+
+    return examples, _finalize_stats(stats, len(examples))
 
 
 def _build_adapt_examples(
@@ -286,11 +734,65 @@ def _build_adapt_examples(
             {
                 "prompt": prompt,
                 "target": _enforce_single_final_boxed(target),
+                "example_type": "mcq" if item.get("options") else "frq",
                 "system_prompt": system_prompt,
                 "source": "competition_adapt",
             }
         )
     return examples
+
+
+def _mix_examples_with_mcq_weight(
+    examples: list[dict],
+    *,
+    mcq_weight: float,
+    seed: int,
+) -> list[dict]:
+    if mcq_weight <= 0:
+        raise SystemExit("--mcq-example-weight must be > 0.")
+    if not examples or abs(mcq_weight - 1.0) < 1e-12:
+        return list(examples)
+
+    rng = random.Random(seed)
+    mcq = [ex for ex in examples if ex.get("example_type") == "mcq"]
+    frq = [ex for ex in examples if ex.get("example_type") != "mcq"]
+    if not mcq:
+        return list(examples)
+
+    weighted_mcq: list[dict] = []
+    if mcq_weight > 1.0:
+        int_part = int(math.floor(mcq_weight))
+        frac = mcq_weight - int_part
+        weighted_mcq.extend(mcq * int_part)
+        if frac > 0:
+            n_extra = int(round(len(mcq) * frac))
+            if n_extra > 0:
+                idxs = sorted(rng.sample(range(len(mcq)), min(n_extra, len(mcq))))
+                weighted_mcq.extend([mcq[i] for i in idxs])
+    else:
+        n_keep = int(round(len(mcq) * mcq_weight))
+        if n_keep > 0:
+            idxs = sorted(rng.sample(range(len(mcq)), min(n_keep, len(mcq))))
+            weighted_mcq.extend([mcq[i] for i in idxs])
+
+    mixed = frq + weighted_mcq
+    rng.shuffle(mixed)
+    return mixed
+
+
+def _print_dataset_samples(name: str, examples: list[dict], n: int = 3) -> None:
+    if not examples:
+        print(f"[samples:{name}] no samples")
+        return
+    k = min(max(3, n), 5, len(examples))
+    print(f"[samples:{name}] showing {k} examples")
+    for i, ex in enumerate(examples[:k], start=1):
+        print(f"--- sample {i} ({name}) ---")
+        print(ex.get("prompt", "").strip())
+        if ex.get("example_type") == "mcq":
+            print(f"Mapped answer letter: {extract_boxed(str(ex.get('target', ''))).upper()}")
+        print("Assistant target:")
+        print(str(ex.get("target", "")).strip())
 
 
 def _tokenize_example(
@@ -363,6 +865,19 @@ def _apply_stage_hparam_defaults(args) -> None:
             args.train_on_full_chat = True
         return
 
+    if args.stage in {"mcq", "mixed_reasoning_mcq"}:
+        if args.learning_rate >= 2e-4:
+            args.learning_rate = ADAPT_DEFAULT_LEARNING_RATE
+        if args.max_steps == 500:
+            args.max_steps = REASONING_DEFAULT_MAX_STEPS if args.stage == "mixed_reasoning_mcq" else ADAPT_DEFAULT_MAX_STEPS
+        if args.train_on_full_chat:
+            print(
+                f"Stage `{args.stage}` defaults to concise targets; "
+                "disabling --train-on-full-chat to protect base behavior."
+            )
+            args.train_on_full_chat = False
+        return
+
     if args.stage == "adapt":
         if args.learning_rate >= 2e-4:
             args.learning_rate = ADAPT_DEFAULT_LEARNING_RATE
@@ -397,33 +912,96 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.stage == "reasoning":
-        if not (args.include_openmath or args.include_hendrycks):
+    dataset_stats: dict[str, dict] = {}
+    dataset_examples: dict[str, list[dict]] = {}
+    if args.stage in {"reasoning", "mcq", "mixed_reasoning_mcq"}:
+        if args.stage == "reasoning" and (args.include_math_mc or args.include_compmath_mcq):
             raise SystemExit(
-                "Stage `reasoning` requires at least one dataset. Pass --include-openmath and/or --include-hendrycks."
+                "Stage `reasoning` is FRQ-only. Use --stage mcq or --stage mixed_reasoning_mcq for MCQ datasets."
+            )
+        if args.stage == "mcq" and not (args.include_math_mc or args.include_compmath_mcq):
+            raise SystemExit(
+                "Stage `mcq` requires at least one MCQ dataset. Pass --include-math-mc and/or --include-compmath-mcq."
             )
 
         all_examples: list[dict] = []
         if args.include_openmath:
             print("Loading unsloth/OpenMathReasoning-mini (split=cot)")
-            openmath_examples = _load_openmath_examples(
+            openmath_examples, openmath_stats = _load_openmath_examples(
                 max_examples=args.max_openmath_examples,
                 seed=args.sample_seed,
             )
-            print(f"OpenMath examples: {len(openmath_examples)}")
+            dataset_examples["openmath"] = openmath_examples
+            dataset_stats["openmath"] = openmath_stats
             all_examples.extend(openmath_examples)
+
         if args.include_hendrycks:
             print("Loading EleutherAI/hendrycks_math")
-            hendrycks_examples = _load_hendrycks_examples(
+            hendrycks_examples, hendrycks_stats = _load_hendrycks_examples(
                 configs=args.hendrycks_configs,
                 max_examples=args.max_hendrycks_examples,
                 seed=args.sample_seed,
             )
-            print(f"Hendrycks examples: {len(hendrycks_examples)}")
+            dataset_examples["hendrycks"] = hendrycks_examples
+            dataset_stats["hendrycks"] = hendrycks_stats
             all_examples.extend(hendrycks_examples)
+
+        if args.include_math_mc:
+            print("Loading XiangPan/math-mc")
+            math_mc_examples, math_mc_stats = _load_math_mc_examples(
+                max_examples=args.max_math_mc_examples,
+                seed=args.sample_seed,
+            )
+            dataset_examples["math_mc"] = math_mc_examples
+            dataset_stats["math_mc"] = math_mc_stats
+            all_examples.extend(math_mc_examples)
+
+        if args.include_compmath_mcq:
+            print("Loading biancaraimondi/CompMath-MCQ")
+            compmath_examples, compmath_stats = _load_compmath_mcq_examples(
+                max_examples=args.max_compmath_mcq_examples,
+                seed=args.sample_seed,
+            )
+            dataset_examples["compmath_mcq"] = compmath_examples
+            dataset_stats["compmath_mcq"] = compmath_stats
+            all_examples.extend(compmath_examples)
+
+        if args.include_base_replay:
+            if not args.base_replay_path:
+                raise SystemExit("--include-base-replay requires --base-replay-path.")
+            replay_path = Path(args.base_replay_path)
+            if not replay_path.is_absolute():
+                replay_path = root / replay_path
+            replay_examples, replay_stats = _load_base_replay_examples(
+                replay_path=replay_path,
+                root=root,
+                max_examples=args.max_base_replay_examples,
+                seed=args.sample_seed,
+            )
+            dataset_examples["base_replay"] = replay_examples
+            dataset_stats["base_replay"] = replay_stats
+            all_examples.extend(replay_examples)
+
+        if args.stage == "reasoning":
+            all_examples = [ex for ex in all_examples if ex.get("example_type") == "frq"]
+        elif args.stage == "mcq":
+            all_examples = [ex for ex in all_examples if ex.get("example_type") == "mcq"]
+
+        all_examples = _mix_examples_with_mcq_weight(
+            all_examples,
+            mcq_weight=args.mcq_example_weight,
+            seed=args.sample_seed,
+        )
+        random.Random(args.sample_seed).shuffle(all_examples)
+
+        if args.print_dataset_samples:
+            for name, samples in dataset_examples.items():
+                _print_dataset_samples(name, samples, n=3)
+
         if not all_examples:
             raise SystemExit(
-                "Stage `reasoning` produced no samples. Enable --include-openmath and/or --include-hendrycks."
+                f"Stage `{args.stage}` produced no training samples. "
+                "Check dataset flags, schema compatibility, and skip-reason logs."
             )
     else:
         input_path = resolve_input_path(args.input, root)
@@ -444,6 +1022,34 @@ def main() -> None:
             holdout_output_path=holdout_path,
         )
         print(f"Adaptation examples: {len(all_examples)}")
+        dataset_examples["competition_adapt"] = all_examples
+        adapt_stats = _new_dataset_stats("competition_adapt")
+        adapt_stats["loaded"] = len(all_examples)
+        adapt_stats["accepted"] = len(all_examples)
+        adapt_stats["skip_reasons"] = {}
+        dataset_stats["competition_adapt"] = adapt_stats
+
+    mcq_count = sum(1 for ex in all_examples if ex.get("example_type") == "mcq")
+    frq_count = sum(1 for ex in all_examples if ex.get("example_type") != "mcq")
+    if mcq_count and frq_count:
+        adapter_strategy = "mixed"
+    elif mcq_count:
+        adapter_strategy = "mcq-only"
+    else:
+        adapter_strategy = "frq-only"
+
+    print("=" * 60)
+    print("Dataset summary")
+    print("=" * 60)
+    for ds_name, st in dataset_stats.items():
+        print(
+            f"[{ds_name}] loaded={st.get('loaded', 0)} accepted={st.get('accepted', 0)} "
+            f"skipped={st.get('skipped', 0)} top_skip_reasons={_top_reasons(st.get('skip_reasons', {}))}"
+        )
+    print(
+        f"Totals: mcq={mcq_count} frq={frq_count} final={len(all_examples)} mode={adapter_strategy}"
+    )
+    print("=" * 60)
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True, use_fast=False)
     if tokenizer.pad_token is None:
@@ -602,9 +1208,31 @@ def main() -> None:
         tokenizer.save_pretrained(merged_dir)
         print(f"Saved merged full model to {merged_dir}")
 
+    config_payload = dict(vars(args))
+    config_payload["adapter_strategy"] = adapter_strategy
+    config_payload["include_base_replay"] = bool(args.include_base_replay)
+    config_payload["base_replay_path"] = args.base_replay_path
+    config_payload["base_replay_count"] = int(dataset_stats.get("base_replay", {}).get("accepted", 0))
+    config_payload["base_replay_filter_stats"] = dataset_stats.get("base_replay", {})
+    config_payload["dataset_stats"] = dataset_stats
+    config_payload["final_mcq_count"] = mcq_count
+    config_payload["final_frq_count"] = frq_count
+    config_payload["final_total_count"] = len(all_examples)
+    config_payload["resumed_from_adapter"] = bool(args.resume_from_adapter)
+    config_payload["do_no_harm_eval_command"] = (
+        "python scripts/modular_pipeline/compare_runs.py "
+        "--input public "
+        "--runs results/base_mcq_eval results/stage1_lora_mcq_eval results/stage2_mcq_lora_eval"
+    )
+    config_payload["recommended_next_eval_command"] = (
+        "python scripts/modular_pipeline/compare_runner.py "
+        "--input public --compare-mode sequential --gated "
+        "--lora-adapter-path artifacts/lora_clean_v1/stage2_mcq_adapt/final_adapter"
+    )
+
     config_path = output_dir / "train_config.json"
     with open(config_path, "w") as f:
-        json.dump(vars(args), f, indent=2, sort_keys=True)
+        json.dump(config_payload, f, indent=2, sort_keys=True)
     print(f"Saved train config to {config_path}")
 
 

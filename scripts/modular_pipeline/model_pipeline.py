@@ -6,7 +6,7 @@ safer MCQ extraction and stronger finalizer recovery.
 
 LoRA debugging:
   - First llm.generate() logs [debug] BEFORE/AFTER markers (see _generate_batch).
-  - Use lora_smoke_test.py for a single-prompt isolation run.
+  - Use modular_pipeline.py or compare_runner.py for isolation checks.
   - Try --no-bitsandbytes or --inference-backend peft if vLLM LoRA hangs.
 """
 

@@ -30,6 +30,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--stage2-stage",
+        choices=("adapt", "mcq", "mixed_reasoning_mcq"),
+        default="adapt",
+        help="Stage used for second-phase adapter training. Default: adapt.",
+    )
+    parser.add_argument(
         "--infer-input",
         default="private",
         help="Inference split/path passed to modular_pipeline.py (default: private).",
@@ -146,6 +152,29 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional Hendrycks cap for Stage 1.",
     )
+    parser.add_argument(
+        "--include-math-mc",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Include math-mc in Stage 2 when stage supports MCQ datasets.",
+    )
+    parser.add_argument(
+        "--include-compmath-mcq",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Include CompMath-MCQ in Stage 2 when stage supports MCQ datasets.",
+    )
+    parser.add_argument("--max-math-mc-examples", type=int, default=None)
+    parser.add_argument("--max-compmath-mcq-examples", type=int, default=None)
+    parser.add_argument("--mcq-example-weight", type=float, default=1.0)
+    parser.add_argument("--print-dataset-samples", action="store_true")
+    parser.add_argument(
+        "--include-base-replay",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--base-replay-path", default=None)
+    parser.add_argument("--max-base-replay-examples", type=int, default=None)
     parser.add_argument(
         "--hendrycks-configs",
         nargs="+",
@@ -295,9 +324,7 @@ def main() -> None:
             sys.executable,
             str(here / "train_lora.py"),
             "--stage",
-            "adapt",
-            "--input",
-            args.adapt_input,
+            args.stage2_stage,
             "--output-dir",
             str(stage2_root),
             "--gpu-id",
@@ -317,28 +344,50 @@ def main() -> None:
             "--resume-from-adapter",
             str(stage1_adapter_path),
         ]
-        if args.stage2_train_on_full_chat:
-            stage2_cmd.append("--stage2-train-on-full-chat")
+        if args.stage2_stage == "adapt":
+            stage2_cmd.extend(["--input", args.adapt_input])
+            if args.stage2_train_on_full_chat:
+                stage2_cmd.append("--stage2-train-on-full-chat")
+            else:
+                stage2_cmd.append("--no-stage2-train-on-full-chat")
+            if args.stage2_final_answer_only:
+                stage2_cmd.append("--stage2-final-answer-only")
+            else:
+                stage2_cmd.append("--no-stage2-final-answer-only")
+            if args.stage2_freeze_reasoning_style:
+                stage2_cmd.append("--stage2-freeze-reasoning-style")
+            else:
+                stage2_cmd.append("--no-stage2-freeze-reasoning-style")
+            stage2_cmd.extend(
+                [
+                    "--stage2-holdout-fraction",
+                    str(args.stage2_holdout_fraction),
+                    "--stage2-holdout-seed",
+                    str(args.stage2_holdout_seed),
+                ]
+            )
+            _append_optional(stage2_cmd, "--limit-mcq", _stage2_train_limit(args.limit_mcq))
+            _append_optional(stage2_cmd, "--limit-free", _stage2_train_limit(args.limit_free))
         else:
-            stage2_cmd.append("--no-stage2-train-on-full-chat")
-        if args.stage2_final_answer_only:
-            stage2_cmd.append("--stage2-final-answer-only")
-        else:
-            stage2_cmd.append("--no-stage2-final-answer-only")
-        if args.stage2_freeze_reasoning_style:
-            stage2_cmd.append("--stage2-freeze-reasoning-style")
-        else:
-            stage2_cmd.append("--no-stage2-freeze-reasoning-style")
-        stage2_cmd.extend(
-            [
-                "--stage2-holdout-fraction",
-                str(args.stage2_holdout_fraction),
-                "--stage2-holdout-seed",
-                str(args.stage2_holdout_seed),
-            ]
-        )
-        _append_optional(stage2_cmd, "--limit-mcq", _stage2_train_limit(args.limit_mcq))
-        _append_optional(stage2_cmd, "--limit-free", _stage2_train_limit(args.limit_free))
+            if args.include_openmath:
+                stage2_cmd.append("--include-openmath")
+            if args.include_hendrycks:
+                stage2_cmd.append("--include-hendrycks")
+            if args.include_math_mc:
+                stage2_cmd.append("--include-math-mc")
+            if args.include_compmath_mcq:
+                stage2_cmd.append("--include-compmath-mcq")
+            if args.include_base_replay:
+                stage2_cmd.append("--include-base-replay")
+            if args.print_dataset_samples:
+                stage2_cmd.append("--print-dataset-samples")
+            stage2_cmd.extend(["--mcq-example-weight", str(args.mcq_example_weight)])
+            _append_optional(stage2_cmd, "--base-replay-path", args.base_replay_path)
+            _append_optional(stage2_cmd, "--max-openmath-examples", args.max_openmath_examples)
+            _append_optional(stage2_cmd, "--max-hendrycks-examples", args.max_hendrycks_examples)
+            _append_optional(stage2_cmd, "--max-math-mc-examples", args.max_math_mc_examples)
+            _append_optional(stage2_cmd, "--max-compmath-mcq-examples", args.max_compmath_mcq_examples)
+            _append_optional(stage2_cmd, "--max-base-replay-examples", args.max_base_replay_examples)
         print("Running Stage 2 adaptation command:")
         print(" ".join(stage2_cmd))
         subprocess.run(stage2_cmd, check=True)
