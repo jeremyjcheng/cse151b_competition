@@ -7,6 +7,7 @@ from pathlib import Path
 
 from settings import (
     STAGE2_DEFAULT_HOLDOUT_FRACTION,
+    STAGE2_MCQ_WITH_REASONING,
     STAGE2_TRAIN_LIMIT_FREE,
     STAGE2_TRAIN_LIMIT_MCQ,
 )
@@ -89,8 +90,17 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "If enabled (default), Stage 2 supervises only final boxed answers for safer "
-            "format adaptation."
+            "If enabled (default), free-form Stage 2 uses box-only labels. "
+            "MCQ reasoning is controlled by --stage2-mcq-with-reasoning."
+        ),
+    )
+    parser.add_argument(
+        "--stage2-mcq-with-reasoning",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "If enabled (default True), Stage 2 MCQ trains on brief reasoning + "
+            "\\boxed{letter}, not bare \\boxed{A} only."
         ),
     )
     parser.add_argument(
@@ -374,6 +384,15 @@ def main() -> None:
             stage2_cmd.append("--stage2-freeze-reasoning-style")
         else:
             stage2_cmd.append("--no-stage2-freeze-reasoning-style")
+        mcq_reasoning = (
+            args.stage2_mcq_with_reasoning
+            if args.stage2_mcq_with_reasoning is not None
+            else STAGE2_MCQ_WITH_REASONING
+        )
+        if mcq_reasoning:
+            stage2_cmd.append("--stage2-mcq-with-reasoning")
+        else:
+            stage2_cmd.append("--no-stage2-mcq-with-reasoning")
         stage2_cmd.extend(
             [
                 "--stage2-holdout-fraction",

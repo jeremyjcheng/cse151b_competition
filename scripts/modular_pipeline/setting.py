@@ -73,6 +73,9 @@ STAGE2_DEFAULT_HOLDOUT_FRACTION = 0.3
 STAGE2_TRAIN_LIMIT_MCQ = 50
 STAGE2_TRAIN_LIMIT_FREE = 25
 
+# Stage-2 MCQ: supervise brief reasoning + final letter (not bare \\boxed{A} only).
+STAGE2_MCQ_WITH_REASONING = True
+
 
 # ============================================================
 # MCQ generation settings
@@ -156,10 +159,11 @@ ENABLE_THINKING_FREE = True
 
 SYSTEM_PROMPT_MCQ = (
     "You solve multiple-choice math problems. "
-    "The final line must be exactly one letter from the listed choices as \\boxed{X}. "
-    "Do not box numbers or option text. "
-    "Output only one \\boxed{...}. "
-    "Stop immediately after that line."
+    "Reason step by step: set up the problem, eliminate wrong options when possible, "
+    "then state the final choice. "
+    "The last line must be exactly one letter from the listed choices as \\boxed{X}. "
+    "Do not box numbers or full option text. "
+    "After the final \\boxed{...}, stop."
 )
 
 SYSTEM_PROMPT_FREE = (

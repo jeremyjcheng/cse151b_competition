@@ -28,6 +28,7 @@ from cli_utils import (
 from prompting import (
     build_adapt_train_free_user,
     build_adapt_train_mcq_user,
+    build_mcq_reasoning_target,
     build_reasoning_train_user,
 )
 from settings import (
@@ -37,6 +38,7 @@ from settings import (
     REASONING_DEFAULT_LEARNING_RATE,
     REASONING_DEFAULT_MAX_STEPS,
     STAGE2_DEFAULT_HOLDOUT_FRACTION,
+    STAGE2_MCQ_WITH_REASONING,
 )
 from text_processing import ensure_boxed, extract_all_boxed, extract_boxed, extract_valid_letter
 
@@ -204,6 +206,7 @@ def _build_adapt_examples(
     sample_seed: int,
     train_on_full_chat: bool,
     final_answer_only: bool,
+    mcq_with_reasoning: bool,
     freeze_reasoning_style: bool,
     holdout_fraction: float,
     holdout_seed: int,
@@ -269,17 +272,26 @@ def _build_adapt_examples(
         )
 
     for item in supervised:
-        if item.get("options"):
+        is_mcq = bool(item.get("options"))
+        if is_mcq:
             letter = _normalize_mcq_answer(item)
             if not letter:
                 continue
-            target = f"\\boxed{{{letter}}}"
-            if train_on_full_chat and not final_answer_only:
-                target = (
-                    "Compute the answer and compare to options carefully.\n"
-                    f"Final answer: \\boxed{{{letter}}}"
-                )
-            prompt = build_adapt_train_mcq_user(item["question"], item["options"])
+            use_mcq_reasoning = mcq_with_reasoning
+            if use_mcq_reasoning:
+                target = build_mcq_reasoning_target(letter)
+            else:
+                target = f"\\boxed{{{letter}}}"
+                if train_on_full_chat and not final_answer_only:
+                    target = (
+                        "Compute the answer and compare to options carefully.\n"
+                        f"Final answer: \\boxed{{{letter}}}"
+                    )
+            prompt = build_adapt_train_mcq_user(
+                item["question"],
+                item["options"],
+                with_reasoning=use_mcq_reasoning,
+            )
         else:
             target = _normalize_free_answer(item)
             if not target:
@@ -291,9 +303,11 @@ def _build_adapt_examples(
                 )
             prompt = build_adapt_train_free_user(item["question"])
 
-        # Conservative default: Stage 2 supervises only final-answer formatting.
-        if final_answer_only:
+        # Free-form: optional box-only labels. MCQ with reasoning keeps scaffold text in labels.
+        if final_answer_only and not (is_mcq and mcq_with_reasoning):
             target = _enforce_single_final_boxed("", fallback_answer=extract_boxed(target))
+        elif final_answer_only and is_mcq and mcq_with_reasoning:
+            target = _enforce_single_final_boxed(target, fallback_answer=letter)
 
         examples.append(
             {
@@ -383,6 +397,8 @@ def _apply_stage_hparam_defaults(args) -> None:
             args.max_steps = ADAPT_DEFAULT_MAX_STEPS
         if args.stage2_holdout_fraction is None:
             args.stage2_holdout_fraction = STAGE2_DEFAULT_HOLDOUT_FRACTION
+        if args.stage2_mcq_with_reasoning is None:
+            args.stage2_mcq_with_reasoning = STAGE2_MCQ_WITH_REASONING
         if args.stage2_final_answer_only and args.train_on_full_chat:
             print(
                 "Stage `adapt` uses --stage2-final-answer-only by default; "
@@ -393,6 +409,11 @@ def _apply_stage_hparam_defaults(args) -> None:
             print(
                 "Stage `adapt` is in conservative mode: preserving Stage-1 reasoning "
                 "style while learning competition answer formatting."
+            )
+        if getattr(args, "stage2_mcq_with_reasoning", STAGE2_MCQ_WITH_REASONING):
+            print(
+                "Stage `adapt` MCQ: supervising brief reasoning + \\boxed{letter} "
+                "(not bare \\boxed{A} only)."
             )
 
 
@@ -456,6 +477,7 @@ def main() -> None:
             sample_seed=args.sample_seed,
             train_on_full_chat=args.train_on_full_chat,
             final_answer_only=args.stage2_final_answer_only,
+            mcq_with_reasoning=args.stage2_mcq_with_reasoning,
             freeze_reasoning_style=args.stage2_freeze_reasoning_style,
             holdout_fraction=float(args.stage2_holdout_fraction),
             holdout_seed=args.stage2_holdout_seed,

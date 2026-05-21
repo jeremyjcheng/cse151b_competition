@@ -403,8 +403,18 @@ def parse_train_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "Stage-2 only: supervise final boxed answers instead of long reasoning traces. "
-            "Recommended to reduce overfitting to public labels."
+            "Stage-2 only: for free-form, supervise final boxed answers only. "
+            "MCQ still uses reasoning scaffolds when --stage2-mcq-with-reasoning is on."
+        ),
+    )
+    parser.add_argument(
+        "--stage2-mcq-with-reasoning",
+        dest="stage2_mcq_with_reasoning",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Stage-2 only: train MCQ on brief reasoning + \\boxed{letter} instead of "
+            "bare \\boxed{A}. Default: True (see setting.STAGE2_MCQ_WITH_REASONING)."
         ),
     )
     parser.add_argument(

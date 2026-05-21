@@ -7,8 +7,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/env.sh"
 
 GPU_ID="${GPU_ID:-0}"
-STAGE1_ADAPTER="${STAGE1_ADAPTER:-workspaces/stage1_reasoning/final_adapter}"
 LOG="logs/stage2_only_$(date +%Y%m%d_%H%M).log"
+
+if [[ -z "${STAGE1_ADAPTER:-}" ]]; then
+  STAGE1_ADAPTER="$(bash "${SCRIPT_DIR}/resolve_stage1_adapter.sh")"
+else
+  STAGE1_ADAPTER="$(cd "$(dirname "$STAGE1_ADAPTER")" && pwd)/$(basename "$STAGE1_ADAPTER")"
+fi
+echo "Stage 1 adapter: $STAGE1_ADAPTER"
 
 if [[ ! -d "$STAGE1_ADAPTER" ]]; then
   echo "Stage 1 adapter not found: $STAGE1_ADAPTER"
