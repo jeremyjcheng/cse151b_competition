@@ -112,7 +112,7 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=STAGE2_DEFAULT_HOLDOUT_FRACTION,
         help=(
-            "Fraction of supervised public items reserved for eval only (default: 0.25). "
+            "Fraction of supervised public items reserved for eval only (default: 0.3). "
             "Stage 2 never trains on holdout items."
         ),
     )
