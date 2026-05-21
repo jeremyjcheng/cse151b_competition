@@ -177,10 +177,29 @@ def main() -> None:
     with open(submission_path, "w", newline="") as f:
         writer = csv.writer(f, quoting=csv.QUOTE_MINIMAL)
         writer.writerow(["id", "response"])
+        short_trace_count = 0
         for item in data:
             rec = records_by_id[item.get("id")]
-            response = str(rec.get("response", "")).replace("\r\n", "\n").replace("\r", "\n")
+            if args.submission_full_trace:
+                meta = rec.get("meta") or {}
+                trace = rec.get("raw") or meta.get("raw") or rec.get("response", "")
+                n_tok = meta.get("n_tokens") or meta.get("total_n_tokens")
+                if isinstance(n_tok, (int, float)) and n_tok < 32:
+                    short_trace_count += 1
+            else:
+                trace = rec.get("response", "")
+            response = str(trace).replace("\r\n", "\n").replace("\r", "\n")
             writer.writerow([rec["id"], response])
+        if args.submission_full_trace:
+            print(
+                "Submission CSV uses full model traces (--submission-full-trace)."
+            )
+            if short_trace_count:
+                print(
+                    f"Warning: {short_trace_count} rows have very short traces (<32 tokens). "
+                    "MCQ-only LoRA often emits only \\boxed{{X}}; use base or Stage-1 LoRA "
+                    "for competition-style reasoning traces."
+                )
     print(f"Saved submission CSV to {submission_path.resolve()}")
 
     if has_answers and not args.no_eval:

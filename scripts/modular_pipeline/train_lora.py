@@ -151,6 +151,11 @@ def _safe_map_answer_to_letter(
     if not answer_text:
         return "", "empty_answer"
 
+    # Common MCQ labels like "d", "(C)", "[B]", "{A}".
+    compact = answer_text.strip().strip("()[]{}").strip().upper()
+    if len(compact) == 1 and compact in labels:
+        return compact, ""
+
     if answer_text.isdigit():
         idx = int(answer_text)
         if 0 <= idx < len(options):
@@ -182,6 +187,38 @@ def _is_strict_single_boxed_letter_target(target: str, letter: str) -> bool:
     if boxed[0].strip().upper() != letter.upper():
         return False
     return bool(re.fullmatch(rf"\\boxed\{{{re.escape(letter.upper())}\}}", text))
+
+
+def _is_valid_mcq_full_trace_target(target: str, letter: str) -> bool:
+    text = str(target).strip()
+    if len(text) < 40:
+        return False
+    boxed = extract_all_boxed(text)
+    if len(boxed) != 1:
+        return False
+    return boxed[-1].strip().upper() == letter.upper()
+
+
+def _build_mcq_training_target(
+    letter: str,
+    *,
+    mode: str,
+    rationale: str = "",
+) -> str:
+    letter = letter.upper()
+    if mode == "letter_only":
+        target = f"\\boxed{{{letter}}}"
+        if not _is_strict_single_boxed_letter_target(target, letter):
+            raise ValueError(f"invalid letter-only MCQ target for letter={letter}")
+        return target
+
+    body = str(rationale).strip()
+    if len(body) < 40:
+        body = (
+            "Let's solve this step by step and compare the listed options carefully.\n\n"
+            "After checking the choices, the correct option letter is:"
+        )
+    return _enforce_single_final_boxed(body, fallback_answer=letter)
 
 
 def _top_reasons(skip_reasons: dict, max_items: int = 5) -> str:
@@ -251,6 +288,121 @@ def _normalize_free_answer(item: dict) -> str:
     if not answer_text:
         return ""
     return _enforce_single_final_boxed("", fallback_answer=answer_text)
+
+
+def _extract_reasoning_solution_from_row(row: dict) -> str:
+    for key in (
+        "response",
+        "solution",
+        "generated_solution",
+        "output",
+        "assistant",
+        "completion",
+        "cot",
+        "rationale",
+        "explanation",
+    ):
+        value = row.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
+def _extract_final_answer_from_row(row: dict) -> str:
+    for key in ("expected_answer", "final_answer", "answer", "target", "label"):
+        value = row.get(key)
+        if value is None:
+            continue
+        if isinstance(value, (list, tuple)):
+            text = ", ".join(str(v).strip() for v in value if str(v).strip())
+        else:
+            text = str(value).strip()
+        if text:
+            return text
+    return ""
+
+
+def _load_metamathqa_examples(max_examples: int | None, seed: int) -> tuple[list[dict], dict]:
+    try:
+        from datasets import load_dataset
+    except Exception as exc:
+        raise RuntimeError(
+            "Stage `reasoning` requires `datasets`. Install with `pip install datasets`."
+        ) from exc
+
+    ds = load_dataset("meta-math/MetaMathQA", split="train")
+    stats = _new_dataset_stats("metamathqa")
+    stats["schema"] = _print_dataset_schema("metamathqa", "train", ds, dict(ds[0]) if len(ds) else None)
+    rows = [dict(row) for row in ds]
+    stats["loaded"] = len(rows)
+    rows = _sample_cap(rows, max_examples, seed)
+
+    examples: list[dict] = []
+    for row in rows:
+        problem = _extract_question_from_row(row)
+        solution = _extract_reasoning_solution_from_row(row)
+        fallback = _extract_final_answer_from_row(row)
+        if not problem or not solution:
+            _skip(stats, "missing_problem_or_solution")
+            continue
+        target = _enforce_single_final_boxed(solution, fallback_answer=fallback)
+        examples.append(
+            {
+                "prompt": build_reasoning_train_user(problem),
+                "target": target,
+                "example_type": "frq",
+                "system_prompt": (
+                    "You are an expert competition mathematician. "
+                    "Provide concise step-by-step reasoning and finish with exactly one final \\boxed{...}."
+                ),
+                "source": "metamathqa",
+            }
+        )
+    return examples, _finalize_stats(stats, len(examples))
+
+
+def _load_numinamath_cot_examples(
+    max_examples: int | None,
+    seed: int,
+) -> tuple[list[dict], dict]:
+    try:
+        from datasets import load_dataset
+    except Exception as exc:
+        raise RuntimeError(
+            "Stage `reasoning` requires `datasets`. Install with `pip install datasets`."
+        ) from exc
+
+    ds = load_dataset("AI-MO/NuminaMath-CoT", split="train")
+    stats = _new_dataset_stats("numinamath_cot")
+    stats["schema"] = _print_dataset_schema(
+        "numinamath_cot", "train", ds, dict(ds[0]) if len(ds) else None
+    )
+    rows = [dict(row) for row in ds]
+    stats["loaded"] = len(rows)
+    rows = _sample_cap(rows, max_examples, seed)
+
+    examples: list[dict] = []
+    for row in rows:
+        problem = _extract_question_from_row(row)
+        solution = _extract_reasoning_solution_from_row(row)
+        fallback = _extract_final_answer_from_row(row)
+        if not problem or not solution:
+            _skip(stats, "missing_problem_or_solution")
+            continue
+        target = _enforce_single_final_boxed(solution, fallback_answer=fallback)
+        examples.append(
+            {
+                "prompt": build_reasoning_train_user(problem),
+                "target": target,
+                "example_type": "frq",
+                "system_prompt": (
+                    "You are an expert competition mathematician. "
+                    "Provide concise step-by-step reasoning and finish with exactly one final \\boxed{...}."
+                ),
+                "source": "numinamath_cot",
+            }
+        )
+    return examples, _finalize_stats(stats, len(examples))
 
 
 def _load_openmath_examples(max_examples: int | None, seed: int) -> tuple[list[dict], dict]:
@@ -373,7 +525,12 @@ def _extract_answer_from_row(row: dict):
     return None
 
 
-def _load_math_mc_examples(max_examples: int | None, seed: int) -> tuple[list[dict], dict]:
+def _load_math_mc_examples(
+    max_examples: int | None,
+    seed: int,
+    *,
+    mcq_target_mode: str = "letter_only",
+) -> tuple[list[dict], dict]:
     try:
         from datasets import load_dataset
     except Exception as exc:
@@ -391,8 +548,36 @@ def _load_math_mc_examples(max_examples: int | None, seed: int) -> tuple[list[di
     examples: list[dict] = []
     for row in rows:
         question = _extract_question_from_row(row)
-        options = _extract_options_from_row(row)
-        answer_value = _extract_answer_from_row(row)
+        # math-mc has both per-letter columns and a `choices` list; try both layouts.
+        option_candidates: list[list[str]] = []
+        letter_cols = [k for k in ("A", "B", "C", "D", "E", "F", "G", "H", "I", "J") if row.get(k) is not None]
+        if letter_cols:
+            opts_from_letters = [str(row[k]).strip() for k in letter_cols if str(row[k]).strip()]
+            if len(opts_from_letters) >= 2:
+                option_candidates.append(opts_from_letters)
+        opts_from_choices = _normalize_options(row.get("choices"))
+        if len(opts_from_choices) >= 2:
+            option_candidates.append(opts_from_choices)
+        opts_from_fallback = _extract_options_from_row(row)
+        if len(opts_from_fallback) >= 2:
+            option_candidates.append(opts_from_fallback)
+
+        # De-duplicate option candidates while preserving order.
+        seen_option_tuples: set[tuple[str, ...]] = set()
+        options: list[str] = []
+        for cand in option_candidates:
+            key = tuple(cand)
+            if key in seen_option_tuples:
+                continue
+            seen_option_tuples.add(key)
+            options = cand
+            break
+
+        # Try multiple answer fields because math-mc mixes conventions.
+        answer_candidates = []
+        for key in ("answer", "Answer", "label", "correct_label", "target", "correct_answer"):
+            if key in row and row.get(key) is not None and str(row.get(key)).strip():
+                answer_candidates.append(row.get(key))
 
         if not question:
             _skip(stats, "missing_question")
@@ -404,13 +589,44 @@ def _load_math_mc_examples(max_examples: int | None, seed: int) -> tuple[list[di
             _skip(stats, "duplicate_options")
             continue
 
-        letter, reason = _safe_map_answer_to_letter(answer_value, options=options)
+        letter = ""
+        reason = "missing_answer"
+        for answer_value in answer_candidates:
+            letter, reason = _safe_map_answer_to_letter(answer_value, options=options)
+            if letter:
+                break
         if not letter:
             _skip(stats, reason or "unmapped_answer")
             continue
 
-        target = f"\\boxed{{{letter}}}"
-        if not _is_strict_single_boxed_letter_target(target, letter):
+        rationale = ""
+        if mcq_target_mode == "full_trace":
+            try:
+                idx = [chr(65 + i) for i in range(len(options))].index(letter.upper())
+                rationale = (
+                    "Let's work through the problem and compare each option.\n\n"
+                    f"Option {letter} matches the correct answer: {options[idx]}"
+                )
+            except ValueError:
+                rationale = ""
+
+        try:
+            target = _build_mcq_training_target(
+                letter,
+                mode=mcq_target_mode,
+                rationale=rationale,
+            )
+        except ValueError:
+            _skip(stats, "invalid_mcq_target_shape")
+            continue
+        if mcq_target_mode == "full_trace" and not _is_valid_mcq_full_trace_target(
+            target, letter
+        ):
+            _skip(stats, "invalid_mcq_full_trace_target")
+            continue
+        if mcq_target_mode == "letter_only" and not _is_strict_single_boxed_letter_target(
+            target, letter
+        ):
             _skip(stats, "invalid_mcq_target_shape")
             continue
 
@@ -422,7 +638,7 @@ def _load_math_mc_examples(max_examples: int | None, seed: int) -> tuple[list[di
                 "answer_letter": letter,
                 "system_prompt": (
                     "You are solving a multiple-choice math question. "
-                    "Reason briefly and end with exactly one final boxed option letter."
+                    "Reason step by step and end with exactly one final boxed option letter."
                 ),
                 "source": "math_mc",
             }
@@ -438,7 +654,12 @@ def _load_math_mc_examples(max_examples: int | None, seed: int) -> tuple[list[di
     return examples, _finalize_stats(stats, len(examples))
 
 
-def _load_compmath_mcq_examples(max_examples: int | None, seed: int) -> tuple[list[dict], dict]:
+def _load_compmath_mcq_examples(
+    max_examples: int | None,
+    seed: int,
+    *,
+    mcq_target_mode: str = "letter_only",
+) -> tuple[list[dict], dict]:
     try:
         from datasets import load_dataset
     except Exception as exc:
@@ -476,8 +697,39 @@ def _load_compmath_mcq_examples(max_examples: int | None, seed: int) -> tuple[li
             _skip(stats, reason or "unmapped_answer")
             continue
 
-        target = f"\\boxed{{{letter}}}"
-        if not _is_strict_single_boxed_letter_target(target, letter):
+        rationale = ""
+        if mcq_target_mode == "full_trace":
+            idx = None
+            if isinstance(answer_value, int) and 0 <= answer_value < len(options):
+                idx = answer_value
+            elif str(answer_value).strip().isdigit():
+                i = int(str(answer_value).strip())
+                if 0 <= i < len(options):
+                    idx = i
+            if idx is not None:
+                lbl = chr(65 + idx)
+                rationale = (
+                    "Let's analyze the problem and eliminate incorrect options.\n\n"
+                    f"Option {lbl} is correct: {options[idx]}"
+                )
+
+        try:
+            target = _build_mcq_training_target(
+                letter,
+                mode=mcq_target_mode,
+                rationale=rationale,
+            )
+        except ValueError:
+            _skip(stats, "invalid_mcq_target_shape")
+            continue
+        if mcq_target_mode == "full_trace" and not _is_valid_mcq_full_trace_target(
+            target, letter
+        ):
+            _skip(stats, "invalid_mcq_full_trace_target")
+            continue
+        if mcq_target_mode == "letter_only" and not _is_strict_single_boxed_letter_target(
+            target, letter
+        ):
             _skip(stats, "invalid_mcq_target_shape")
             continue
 
@@ -489,7 +741,7 @@ def _load_compmath_mcq_examples(max_examples: int | None, seed: int) -> tuple[li
                 "answer_letter": letter,
                 "system_prompt": (
                     "You are solving a multiple-choice math question. "
-                    "Reason briefly and end with exactly one final boxed option letter."
+                    "Reason step by step and end with exactly one final boxed option letter."
                 ),
                 "source": "compmath_mcq",
             }
@@ -531,6 +783,8 @@ def _load_base_replay_examples(
     root: Path,
     max_examples: int | None,
     seed: int,
+    mcq_target_mode: str = "letter_only",
+    mcq_replay_min_tokens: int = 32,
 ) -> tuple[list[dict], dict]:
     if not replay_path.exists():
         raise SystemExit(f"--base-replay-path not found: {replay_path}")
@@ -556,7 +810,8 @@ def _load_base_replay_examples(
     for row in rows:
         response = str(row.get("response", "")).strip()
         meta = row.get("meta") or {}
-        if not response:
+        raw_trace = str(row.get("raw") or meta.get("raw") or "").strip()
+        if not response and not raw_trace:
             _skip(stats, "missing_response")
             continue
 
@@ -608,14 +863,35 @@ def _load_base_replay_examples(
                 _skip(stats, "missing_options_for_replay_mcq")
                 continue
             labels = [chr(65 + i) for i in range(len(options))]
-            letter = extract_valid_letter(response, labels)
+            gold_letter = _normalize_mcq_answer(ref_item) if ref_item.get("answer") else ""
+            trace_for_letter = raw_trace or response
+            letter = extract_valid_letter(trace_for_letter, labels)
+            if not letter and gold_letter:
+                letter = gold_letter
             if not letter:
                 _skip(stats, "invalid_replay_mcq_letter")
                 continue
-            target = f"\\boxed{{{letter}}}"
-            if not _is_strict_single_boxed_letter_target(target, letter):
-                _skip(stats, "invalid_replay_mcq_target_shape")
+            if gold_letter and letter.upper() != gold_letter.upper():
+                _skip(stats, "replay_letter_mismatch_gold")
                 continue
+
+            if mcq_target_mode == "full_trace":
+                n_tok = meta.get("n_tokens") or meta.get("total_n_tokens")
+                if isinstance(n_tok, (int, float)) and n_tok < mcq_replay_min_tokens:
+                    _skip(stats, "replay_trace_too_short")
+                    continue
+                if not raw_trace:
+                    _skip(stats, "replay_missing_raw_trace")
+                    continue
+                target = _enforce_single_final_boxed(raw_trace, fallback_answer=letter)
+                if not _is_valid_mcq_full_trace_target(target, letter):
+                    _skip(stats, "invalid_replay_mcq_full_trace_target")
+                    continue
+            else:
+                target = _build_mcq_training_target(letter, mode="letter_only")
+                if not _is_strict_single_boxed_letter_target(target, letter):
+                    _skip(stats, "invalid_replay_mcq_target_shape")
+                    continue
             prompt = _build_strict_mcq_prompt(question, options)
             example_type = "mcq"
         else:
@@ -855,6 +1131,23 @@ def _set_seed(seed: int) -> None:
 
 
 def _apply_stage_hparam_defaults(args) -> None:
+    if args.stage in {"reasoning", "mixed_reasoning_mcq"}:
+        reasoning_dataset_selected = any(
+            (
+                getattr(args, "include_metamathqa", False),
+                getattr(args, "include_numinamath_cot", False),
+                getattr(args, "include_openmath", False),
+                getattr(args, "include_hendrycks", False),
+            )
+        )
+        if not reasoning_dataset_selected:
+            args.include_metamathqa = True
+            args.include_numinamath_cot = True
+            print(
+                "No reasoning dataset flag provided; defaulting to "
+                "--include-metamathqa and --include-numinamath-cot."
+            )
+
     if args.stage == "reasoning":
         if args.learning_rate >= 2e-4:
             args.learning_rate = REASONING_DEFAULT_LEARNING_RATE
@@ -876,6 +1169,16 @@ def _apply_stage_hparam_defaults(args) -> None:
                 "disabling --train-on-full-chat to protect base behavior."
             )
             args.train_on_full_chat = False
+        if getattr(args, "mcq_target_mode", "letter_only") == "full_trace":
+            print(
+                "MCQ target mode `full_trace`: use --include-base-replay with base JSONL `raw` "
+                "for real chain-of-thought. Hub MCQ rows use short rationale stubs only."
+            )
+            if not args.include_base_replay:
+                print(
+                    "Warning: --mcq-target-mode full_trace without --include-base-replay "
+                    "will not learn real thinking traces from external MCQ datasets."
+                )
         return
 
     if args.stage == "adapt":
@@ -925,6 +1228,26 @@ def main() -> None:
             )
 
         all_examples: list[dict] = []
+        if args.include_metamathqa:
+            print("Loading meta-math/MetaMathQA")
+            metamath_examples, metamath_stats = _load_metamathqa_examples(
+                max_examples=args.max_metamathqa_examples,
+                seed=args.sample_seed,
+            )
+            dataset_examples["metamathqa"] = metamath_examples
+            dataset_stats["metamathqa"] = metamath_stats
+            all_examples.extend(metamath_examples)
+
+        if args.include_numinamath_cot:
+            print("Loading AI-MO/NuminaMath-CoT")
+            numina_examples, numina_stats = _load_numinamath_cot_examples(
+                max_examples=args.max_numinamath_cot_examples,
+                seed=args.sample_seed,
+            )
+            dataset_examples["numinamath_cot"] = numina_examples
+            dataset_stats["numinamath_cot"] = numina_stats
+            all_examples.extend(numina_examples)
+
         if args.include_openmath:
             print("Loading unsloth/OpenMathReasoning-mini (split=cot)")
             openmath_examples, openmath_stats = _load_openmath_examples(
@@ -951,6 +1274,7 @@ def main() -> None:
             math_mc_examples, math_mc_stats = _load_math_mc_examples(
                 max_examples=args.max_math_mc_examples,
                 seed=args.sample_seed,
+                mcq_target_mode=args.mcq_target_mode,
             )
             dataset_examples["math_mc"] = math_mc_examples
             dataset_stats["math_mc"] = math_mc_stats
@@ -961,6 +1285,7 @@ def main() -> None:
             compmath_examples, compmath_stats = _load_compmath_mcq_examples(
                 max_examples=args.max_compmath_mcq_examples,
                 seed=args.sample_seed,
+                mcq_target_mode=args.mcq_target_mode,
             )
             dataset_examples["compmath_mcq"] = compmath_examples
             dataset_stats["compmath_mcq"] = compmath_stats
@@ -977,6 +1302,8 @@ def main() -> None:
                 root=root,
                 max_examples=args.max_base_replay_examples,
                 seed=args.sample_seed,
+                mcq_target_mode=args.mcq_target_mode,
+                mcq_replay_min_tokens=args.mcq_replay_min_tokens,
             )
             dataset_examples["base_replay"] = replay_examples
             dataset_stats["base_replay"] = replay_stats

@@ -143,6 +143,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--submission-full-trace",
+        action="store_true",
+        help=(
+            "Write the competition CSV `response` column from the full model trace "
+            "(JSONL `raw` field), including chain-of-thought and a final \\boxed{...}. "
+            "Default CSV uses canonicalized MCQ letters only."
+        ),
+    )
+    parser.add_argument(
         "--mcq-max-new-tokens",
         type=int,
         default=MAX_TOKENS_MCQ,
@@ -312,6 +321,30 @@ def parse_train_args() -> argparse.Namespace:
         help="Seed for subset selection when limits are enabled.",
     )
     parser.add_argument(
+        "--include-metamathqa",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Include meta-math/MetaMathQA in reasoning-capable stages (recommended).",
+    )
+    parser.add_argument(
+        "--include-numinamath-cot",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Include AI-MO/NuminaMath-CoT in reasoning-capable stages (recommended).",
+    )
+    parser.add_argument(
+        "--max-metamathqa-examples",
+        type=int,
+        default=None,
+        help="Optional cap for MetaMathQA examples in reasoning-capable stages.",
+    )
+    parser.add_argument(
+        "--max-numinamath-cot-examples",
+        type=int,
+        default=None,
+        help="Optional cap for NuminaMath-CoT examples in reasoning-capable stages.",
+    )
+    parser.add_argument(
         "--include-openmath",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -369,6 +402,24 @@ def parse_train_args() -> argparse.Namespace:
         help=(
             "Relative weight for MCQ examples in mixed training. "
             "1.0 keeps natural counts; >1 upsamples MCQ; <1 downsamples MCQ."
+        ),
+    )
+    parser.add_argument(
+        "--mcq-target-mode",
+        choices=("letter_only", "full_trace"),
+        default="letter_only",
+        help=(
+            "MCQ supervision shape. `letter_only` trains on \\boxed{letter} only (fast, no CoT). "
+            "`full_trace` trains on reasoning text ending in \\boxed{letter}: base-replay uses "
+            "JSONL `raw` traces; hub MCQ sets use a short rationale stub (no real CoT in those datasets)."
+        ),
+    )
+    parser.add_argument(
+        "--mcq-replay-min-tokens",
+        type=int,
+        default=32,
+        help=(
+            "With --mcq-target-mode full_trace, skip base-replay rows whose meta n_tokens is below this."
         ),
     )
     parser.add_argument(
