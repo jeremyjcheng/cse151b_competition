@@ -459,7 +459,7 @@ def _apply_stage_hparam_defaults(args) -> None:
             args.max_steps = ADAPT_DEFAULT_MAX_STEPS
         if args.stage2_holdout_fraction is None:
             args.stage2_holdout_fraction = STAGE2_DEFAULT_HOLDOUT_FRACTION
-        if args.stage2_mcq_with_reasoning is None:
+        if getattr(args, "stage2_mcq_with_reasoning", None) is None:
             args.stage2_mcq_with_reasoning = STAGE2_MCQ_WITH_REASONING
         if args.max_seq_len == MAX_SEQ_LEN:
             args.max_seq_len = ADAPT_DEFAULT_MAX_SEQ_LEN
@@ -482,14 +482,25 @@ def _apply_stage_hparam_defaults(args) -> None:
             )
 
 
+def _normalize_optional_train_args(args) -> None:
+    """Defaults for flags that may be missing if cli_utils.py is older than train_lora.py."""
+    if getattr(args, "load_in_4bit", None) is None:
+        args.load_in_4bit = TRAIN_LOAD_IN_4BIT
+    if getattr(args, "load_in_8bit", None) is None:
+        args.load_in_8bit = False
+    if getattr(args, "gradient_checkpointing", None) is None:
+        args.gradient_checkpointing = True
+    if getattr(args, "use_bnb_optimizer", None) is None:
+        args.use_bnb_optimizer = False
+    if getattr(args, "stage2_mcq_with_reasoning", None) is None:
+        args.stage2_mcq_with_reasoning = STAGE2_MCQ_WITH_REASONING
+
+
 def main() -> None:
     args = parse_train_args()
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
     _set_seed(args.seed)
-    if args.load_in_4bit is None:
-        args.load_in_4bit = TRAIN_LOAD_IN_4BIT
-    if getattr(args, "gradient_checkpointing", None) is None:
-        args.gradient_checkpointing = True
+    _normalize_optional_train_args(args)
     _apply_stage_hparam_defaults(args)
 
     if torch.cuda.is_available():
@@ -568,7 +579,7 @@ def main() -> None:
     load_in_8bit = bool(getattr(args, "load_in_8bit", False))
     base_model = _load_base_model(
         MODEL_ID,
-        load_in_4bit=bool(args.load_in_4bit),
+        load_in_4bit=bool(getattr(args, "load_in_4bit", False)),
         load_in_8bit=load_in_8bit,
     )
     if args.resume_from_adapter:
@@ -592,7 +603,7 @@ def main() -> None:
     if hasattr(model, "print_trainable_parameters"):
         model.print_trainable_parameters()
 
-    if args.gradient_checkpointing:
+    if getattr(args, "gradient_checkpointing", True):
         _enable_gradient_checkpointing(model)
 
     tokenized_dataset = []
