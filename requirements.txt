@@ -153,7 +153,8 @@ vllm>=0.10.0
 watchfiles==1.1.1
 websockets==16.0
 wrapt==2.1.2
-xformers==0.0.29.post2
+# xformers omitted: optional for vLLM; often fails to build on Python 3.13+ without
+# prebuilt wheels. Install after torch via scripts/server/setup.sh if needed.
 xgrammar==0.1.18
 xxhash==3.7.0
 yarl==1.23.0

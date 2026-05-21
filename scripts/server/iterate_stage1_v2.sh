@@ -1,14 +1,10 @@
 #!/usr/bin/env bash
-# Phase 2/3: stronger Stage 1 (1500 steps) then Stage 2 only (skip Stage 1 in orchestrator)
+# Phase 2/3: stronger Stage 1 (1500 steps) then Stage 2 only
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cd "$ROOT"
-
-# shellcheck disable=SC1091
-source .venv/bin/activate
-export PYTHONUNBUFFERED=1
-PY="${ROOT}/.venv/bin/python"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=env.sh
+source "${SCRIPT_DIR}/env.sh"
 
 GPU_ID="${GPU_ID:-0}"
 STAGE1_OUT="${STAGE1_OUT:-workspaces/stage1_reasoning_v2}"
@@ -30,5 +26,4 @@ nohup "$PY" scripts/modular_pipeline/train_lora.py \
 
 echo $! > logs/stage1_v2.pid
 echo "Stage 1 v2 PID=$(cat logs/stage1_v2.pid). Wait for completion, then run:"
-echo ""
 echo "  STAGE1_ADAPTER=$STAGE1_OUT/final_adapter bash scripts/server/run_stage2_only.sh"

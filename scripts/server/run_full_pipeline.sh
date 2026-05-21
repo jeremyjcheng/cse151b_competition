@@ -2,13 +2,9 @@
 # Phase 1: long-running Stage 1 -> Stage 2 -> holdout eval (no private infer)
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cd "$ROOT"
-
-# shellcheck disable=SC1091
-source .venv/bin/activate
-export PYTHONUNBUFFERED=1
-PY="${ROOT}/.venv/bin/python"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=env.sh
+source "${SCRIPT_DIR}/env.sh"
 
 GPU_ID="${GPU_ID:-0}"
 REASONING_STEPS="${REASONING_STEPS:-1000}"
@@ -16,6 +12,8 @@ ADAPT_STEPS="${ADAPT_STEPS:-60}"
 LOG="logs/full_pipeline_$(date +%Y%m%d_%H%M).log"
 
 mkdir -p logs workspaces results
+
+bash "${SCRIPT_DIR}/check_env.sh"
 
 echo "Logging to $LOG"
 echo "PID will be written to logs/full_pipeline.pid"

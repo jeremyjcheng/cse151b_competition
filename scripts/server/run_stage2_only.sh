@@ -2,13 +2,9 @@
 # Re-run Stage 2 + eval using an existing Stage 1 adapter
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-cd "$ROOT"
-
-# shellcheck disable=SC1091
-source .venv/bin/activate
-export PYTHONUNBUFFERED=1
-PY="${ROOT}/.venv/bin/python"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=env.sh
+source "${SCRIPT_DIR}/env.sh"
 
 GPU_ID="${GPU_ID:-0}"
 STAGE1_ADAPTER="${STAGE1_ADAPTER:-workspaces/stage1_reasoning/final_adapter}"

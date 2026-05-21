@@ -84,17 +84,18 @@ python scripts/modular_pipeline/train_lora.py \
   --val-eval-every-steps 20
 ```
 
-## Server scripts (long GPU run)
+## GPU server install (read this first)
 
-For tmux/nohup automation matching the Stage 1 + Stage 2 plan, see [`scripts/server/README.md`](scripts/server/README.md).
+Use your existing **conda env `vllm`** — do **not** use `.venv` or `pip install -r requirements.txt` (xformers breaks on 3.13).
 
 ```bash
-bash scripts/server/setup.sh
-bash scripts/server/run_full_pipeline.sh   # Stage 1 -> 2 -> holdout eval
-bash scripts/server/monitor.sh
-bash scripts/server/eval_checkpoints.sh    # after training
-bash scripts/server/private_submit.sh      # verify + private infer
+bash install_gpu.sh              # removes .venv, installs into conda vllm
+conda activate vllm
+bash scripts/server/test_installs.sh   # must PASS
+bash scripts/server/run_full_pipeline.sh
 ```
+
+See [`scripts/server/README.md`](scripts/server/README.md) for details.
 
 ## End-to-end workflow
 
