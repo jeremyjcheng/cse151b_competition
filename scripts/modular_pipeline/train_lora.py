@@ -375,6 +375,28 @@ def _collate_batch(tokenizer, batch: list[dict[str, torch.Tensor]]) -> dict[str,
     return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
 
+def _resume_peft_adapter(base_model, adapter_path: str):
+    """Load Stage-1 LoRA without PeftModel.from_pretrained (avoids broken bitsandbytes on some clusters)."""
+    from peft import PeftConfig, get_peft_model
+    from peft.utils.save_and_load import load_peft_weights, set_peft_model_state_dict
+
+    adapter_path = str(Path(adapter_path).resolve())
+    config = PeftConfig.from_pretrained(adapter_path)
+    model = get_peft_model(base_model, config)
+    adapter_name = getattr(config, "adapter_name", None) or "default"
+    if hasattr(model, "active_adapter") and model.active_adapter:
+        adapter_name = model.active_adapter
+    if isinstance(adapter_name, list):
+        adapter_name = adapter_name[0]
+
+    weights = load_peft_weights(adapter_path, adapter_name=adapter_name)
+    incompatible = set_peft_model_state_dict(model, weights, adapter_name=adapter_name)
+    if incompatible:
+        print(f"Note: {len(incompatible)} adapter keys not loaded (may be benign).")
+
+    return model
+
+
 def _enable_gradient_checkpointing(model) -> None:
     if hasattr(model, "gradient_checkpointing_enable"):
         model.gradient_checkpointing_enable()
@@ -574,7 +596,7 @@ def main() -> None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
-    from peft import LoraConfig, PeftModel, get_peft_model
+    from peft import LoraConfig, get_peft_model
 
     load_in_8bit = bool(getattr(args, "load_in_8bit", False))
     base_model = _load_base_model(
@@ -584,11 +606,18 @@ def main() -> None:
     )
     if args.resume_from_adapter:
         print(f"Resuming from adapter: {args.resume_from_adapter}")
-        model = PeftModel.from_pretrained(
-            base_model,
-            args.resume_from_adapter,
-            is_trainable=True,
-        )
+        try:
+            model = _resume_peft_adapter(base_model, args.resume_from_adapter)
+            print("Loaded adapter via PEFT weight files (no bitsandbytes).")
+        except Exception as exc:
+            print(f"PEFT weight load failed ({exc}); trying PeftModel.from_pretrained ...")
+            from peft import PeftModel
+
+            model = PeftModel.from_pretrained(
+                base_model,
+                args.resume_from_adapter,
+                is_trainable=True,
+            )
     else:
         lora_config = LoraConfig(
             r=args.lora_r,
