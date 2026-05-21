@@ -168,6 +168,27 @@ def parse_eval_args() -> argparse.Namespace:
             "safer on clusters missing libnvJitLink.so.13."
         ),
     )
+    parser.add_argument(
+        "--load-in-8bit",
+        dest="load_in_8bit",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Load base model in 8-bit (less VRAM than bf16; may work when 4-bit fails).",
+    )
+    parser.add_argument(
+        "--gradient-checkpointing",
+        dest="gradient_checkpointing",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable gradient checkpointing to reduce VRAM (default: on).",
+    )
+    parser.add_argument(
+        "--use-bnb-optimizer",
+        dest="use_bnb_optimizer",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use bitsandbytes PagedAdamW8bit (default: torch AdamW on LoRA only).",
+    )
     parser.add_argument("--lora-adapter-path", default=None)
     parser.add_argument("--vllm-quantization", default=None)
     parser.add_argument("--vllm-load-format", default=None)

@@ -39,6 +39,7 @@ from settings import (
     REASONING_DEFAULT_MAX_STEPS,
     STAGE2_DEFAULT_HOLDOUT_FRACTION,
     STAGE2_MCQ_WITH_REASONING,
+    ADAPT_DEFAULT_MAX_SEQ_LEN,
     TRAIN_LOAD_IN_4BIT,
 )
 from text_processing import ensure_boxed, extract_all_boxed, extract_boxed, extract_valid_letter
@@ -373,9 +374,33 @@ def _collate_batch(tokenizer, batch: list[dict[str, torch.Tensor]]) -> dict[str,
     return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
 
-def _load_base_model(model_id: str, *, load_in_4bit: bool):
+def _enable_gradient_checkpointing(model) -> None:
+    if hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
+        print("Gradient checkpointing enabled (lower VRAM during training).")
+    elif hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
+
+
+def _load_base_model(model_id: str, *, load_in_4bit: bool, load_in_8bit: bool = False):
     """Load base model for LoRA training. Default path is bf16 (no bitsandbytes quant)."""
     from peft import prepare_model_for_kbit_training
+
+    if load_in_8bit and not load_in_4bit:
+        print("Loading base model in 8-bit (bitsandbytes)...")
+        try:
+            bnb_config = BitsAndBytesConfig(load_in_8bit=True)
+            model = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                trust_remote_code=True,
+                quantization_config=bnb_config,
+                device_map="auto",
+                low_cpu_mem_usage=True,
+            )
+            return prepare_model_for_kbit_training(model)
+        except Exception as exc:
+            print(f"8-bit load failed: {exc}")
+            print("Falling back to bfloat16.")
 
     if load_in_4bit:
         print("Loading base model in 4-bit (bitsandbytes)...")
@@ -390,6 +415,7 @@ def _load_base_model(model_id: str, *, load_in_4bit: bool):
                 trust_remote_code=True,
                 quantization_config=bnb_config,
                 device_map="auto",
+                low_cpu_mem_usage=True,
             )
             return prepare_model_for_kbit_training(model)
         except Exception as exc:
@@ -403,6 +429,7 @@ def _load_base_model(model_id: str, *, load_in_4bit: bool):
         trust_remote_code=True,
         torch_dtype=dtype,
         device_map="auto",
+        low_cpu_mem_usage=True,
     )
 
 
@@ -433,6 +460,9 @@ def _apply_stage_hparam_defaults(args) -> None:
             args.stage2_holdout_fraction = STAGE2_DEFAULT_HOLDOUT_FRACTION
         if args.stage2_mcq_with_reasoning is None:
             args.stage2_mcq_with_reasoning = STAGE2_MCQ_WITH_REASONING
+        if args.max_seq_len == MAX_SEQ_LEN:
+            args.max_seq_len = ADAPT_DEFAULT_MAX_SEQ_LEN
+            print(f"Stage `adapt` using max_seq_len={ADAPT_DEFAULT_MAX_SEQ_LEN} (lower VRAM).")
         if args.stage2_final_answer_only and args.train_on_full_chat:
             print(
                 "Stage `adapt` uses --stage2-final-answer-only by default; "
@@ -457,7 +487,12 @@ def main() -> None:
     _set_seed(args.seed)
     if args.load_in_4bit is None:
         args.load_in_4bit = TRAIN_LOAD_IN_4BIT
+    if getattr(args, "gradient_checkpointing", None) is None:
+        args.gradient_checkpointing = True
     _apply_stage_hparam_defaults(args)
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     here = Path(__file__).resolve().parent
     root = _discover_project_root(here)
@@ -529,7 +564,12 @@ def main() -> None:
 
     from peft import LoraConfig, PeftModel, get_peft_model
 
-    base_model = _load_base_model(MODEL_ID, load_in_4bit=bool(args.load_in_4bit))
+    load_in_8bit = bool(getattr(args, "load_in_8bit", False))
+    base_model = _load_base_model(
+        MODEL_ID,
+        load_in_4bit=bool(args.load_in_4bit),
+        load_in_8bit=load_in_8bit,
+    )
     if args.resume_from_adapter:
         print(f"Resuming from adapter: {args.resume_from_adapter}")
         model = PeftModel.from_pretrained(
@@ -550,6 +590,9 @@ def main() -> None:
 
     if hasattr(model, "print_trainable_parameters"):
         model.print_trainable_parameters()
+
+    if args.gradient_checkpointing:
+        _enable_gradient_checkpointing(model)
 
     tokenized_dataset = []
     skipped = 0
@@ -577,18 +620,23 @@ def main() -> None:
     )
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    try:
-        import bitsandbytes as bnb
+    use_bnb_optim = bool(getattr(args, "use_bnb_optimizer", False))
+    optimizer = None
+    if use_bnb_optim:
+        try:
+            import bitsandbytes as bnb
 
-        optimizer = bnb.optim.PagedAdamW8bit(
-            trainable_params,
-            lr=args.learning_rate,
-            betas=(0.9, 0.999),
-            eps=1e-8,
-            weight_decay=args.weight_decay,
-        )
-        print("Using bitsandbytes PagedAdamW8bit optimizer")
-    except Exception:
+            optimizer = bnb.optim.PagedAdamW8bit(
+                trainable_params,
+                lr=args.learning_rate,
+                betas=(0.9, 0.999),
+                eps=1e-8,
+                weight_decay=args.weight_decay,
+            )
+            print("Using bitsandbytes PagedAdamW8bit optimizer")
+        except Exception as exc:
+            print(f"bitsandbytes optimizer failed ({exc}); using torch.optim.AdamW")
+    if optimizer is None:
         optimizer = torch.optim.AdamW(
             trainable_params,
             lr=args.learning_rate,
@@ -596,7 +644,7 @@ def main() -> None:
             eps=1e-8,
             weight_decay=args.weight_decay,
         )
-        print("bitsandbytes optimizer unavailable; using torch.optim.AdamW")
+        print("Using torch.optim.AdamW on trainable LoRA params only")
 
     warmup_steps = int(args.max_steps * args.warmup_ratio)
     scheduler = get_linear_schedule_with_warmup(

@@ -79,6 +79,9 @@ STAGE2_MCQ_WITH_REASONING = True
 # Training load: False = bfloat16 full weights (avoids bitsandbytes 4-bit / libnvJitLink issues).
 TRAIN_LOAD_IN_4BIT = False
 
+# Stage-2 sequences are shorter; lower cap reduces OOM risk during bf16 training.
+ADAPT_DEFAULT_MAX_SEQ_LEN = 1024
+
 
 # ============================================================
 # MCQ generation settings
