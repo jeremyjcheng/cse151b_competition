@@ -40,6 +40,7 @@ from settings import (
     STAGE2_DEFAULT_HOLDOUT_FRACTION,
     STAGE2_MCQ_WITH_REASONING,
     ADAPT_DEFAULT_MAX_SEQ_LEN,
+    MAX_SEQ_LEN,
     TRAIN_LOAD_IN_4BIT,
 )
 from text_processing import ensure_boxed, extract_all_boxed, extract_boxed, extract_valid_letter
