@@ -39,6 +39,7 @@ from settings import (
     REASONING_DEFAULT_MAX_STEPS,
     STAGE2_DEFAULT_HOLDOUT_FRACTION,
     STAGE2_MCQ_WITH_REASONING,
+    TRAIN_LOAD_IN_4BIT,
 )
 from text_processing import ensure_boxed, extract_all_boxed, extract_boxed, extract_valid_letter
 
@@ -372,6 +373,39 @@ def _collate_batch(tokenizer, batch: list[dict[str, torch.Tensor]]) -> dict[str,
     return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
 
 
+def _load_base_model(model_id: str, *, load_in_4bit: bool):
+    """Load base model for LoRA training. Default path is bf16 (no bitsandbytes quant)."""
+    from peft import prepare_model_for_kbit_training
+
+    if load_in_4bit:
+        print("Loading base model in 4-bit (bitsandbytes)...")
+        try:
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+            )
+            model = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                trust_remote_code=True,
+                quantization_config=bnb_config,
+                device_map="auto",
+            )
+            return prepare_model_for_kbit_training(model)
+        except Exception as exc:
+            print(f"4-bit load failed: {exc}")
+            print("Falling back to bfloat16 weights (set --no-load-in-4bit to skip 4-bit attempt).")
+
+    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    print(f"Loading base model in {dtype} (no 4-bit quantization)...")
+    return AutoModelForCausalLM.from_pretrained(
+        model_id,
+        trust_remote_code=True,
+        torch_dtype=dtype,
+        device_map="auto",
+    )
+
+
 def _set_seed(seed: int) -> None:
     random.seed(seed)
     torch.manual_seed(seed)
@@ -421,6 +455,8 @@ def main() -> None:
     args = parse_train_args()
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
     _set_seed(args.seed)
+    if args.load_in_4bit is None:
+        args.load_in_4bit = TRAIN_LOAD_IN_4BIT
     _apply_stage_hparam_defaults(args)
 
     here = Path(__file__).resolve().parent
@@ -491,21 +527,9 @@ def main() -> None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_use_double_quant=True,
-    )
-    base_model = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID,
-        trust_remote_code=True,
-        quantization_config=bnb_config,
-        device_map="auto",
-    )
+    from peft import LoraConfig, PeftModel, get_peft_model
 
-    from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
-
-    base_model = prepare_model_for_kbit_training(base_model)
+    base_model = _load_base_model(MODEL_ID, load_in_4bit=bool(args.load_in_4bit))
     if args.resume_from_adapter:
         print(f"Resuming from adapter: {args.resume_from_adapter}")
         model = PeftModel.from_pretrained(

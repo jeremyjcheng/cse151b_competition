@@ -76,6 +76,9 @@ STAGE2_TRAIN_LIMIT_FREE = 25
 # Stage-2 MCQ: supervise brief reasoning + final letter (not bare \\boxed{A} only).
 STAGE2_MCQ_WITH_REASONING = True
 
+# Training load: False = bfloat16 full weights (avoids bitsandbytes 4-bit / libnvJitLink issues).
+TRAIN_LOAD_IN_4BIT = False
+
 
 # ============================================================
 # MCQ generation settings

@@ -158,6 +158,16 @@ def parse_eval_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--gpu-id", default="0")
+    parser.add_argument(
+        "--load-in-4bit",
+        dest="load_in_4bit",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Load base model in 4-bit via bitsandbytes. Default False (bfloat16) — "
+            "safer on clusters missing libnvJitLink.so.13."
+        ),
+    )
     parser.add_argument("--lora-adapter-path", default=None)
     parser.add_argument("--vllm-quantization", default=None)
     parser.add_argument("--vllm-load-format", default=None)
