@@ -22,6 +22,14 @@ def main() -> int:
 
     print(f"Python: {sys.executable}")
     print(f"Version: {sys.version}")
+    if os.environ.get("PYTHONNOUSERSITE") != "1":
+        print("WARNING: PYTHONNOUSERSITE is not 1 — ~/.local may shadow conda packages.")
+        print("  Use: source scripts/server/activate_vllm.sh")
+    import site as _site
+
+    user_site = getattr(_site, "USER_SITE", "")
+    if user_site and user_site in sys.path:
+        print(f"WARNING: user-site on sys.path: {user_site}")
     conda_env = os.environ.get("CONDA_DEFAULT_ENV", "")
     if conda_env:
         print(f"CONDA_DEFAULT_ENV: {conda_env}")
@@ -57,6 +65,12 @@ def main() -> int:
         ("safetensors", "safetensors"),
     ]
 
+    if "/.local/" in sys.executable or "envs/vllm" not in sys.executable.replace("\\", "/"):
+        print(
+            "WARNING: Python is not clearly from conda env vllm — "
+            "run: source scripts/server/activate_vllm.sh"
+        )
+
     failed = 0
     for name, path in required:
         ok, msg = _check(name, path)
@@ -83,6 +97,16 @@ def main() -> int:
             failed += 1
     except Exception as exc:
         print(f"torch CUDA check: FAIL ({exc})")
+        failed += 1
+
+    print()
+    print("--- vLLM LoRA (eval / checkpoint sweep) ---")
+    try:
+        from vllm.lora.request import LoRARequest  # noqa: F401
+
+        print("vllm.lora.request.LoRARequest: OK")
+    except Exception as exc:
+        print(f"vllm.lora.request.LoRARequest: FAIL ({exc})")
         failed += 1
 
     print()

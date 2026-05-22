@@ -20,8 +20,44 @@ bash scripts/server/install_into_vllm.sh
 ## Activate vllm first (required)
 
 ```bash
+# Option A — activate in current shell (bash or zsh)
 source scripts/server/activate_vllm.sh
-# or: conda activate vllm   (from project root, after remove_venv)
+
+# Option B — safe if sourcing still closes your terminal: new bash subshell
+bash scripts/server/enter_vllm.sh
+
+# Diagnose — always bash, never source
+bash scripts/server/diagnose_vllm.sh
+```
+
+**zsh users:** old scripts used `set -e` + `exit` when sourced, which **closes the whole terminal**. Pull latest `LoRA` branch. If unsure, use `bash scripts/server/enter_vllm.sh` instead of `source`.
+
+Do NOT use `python` from `/opt/conda/bin` (base) or `~/.local` pip installs.
+
+### `libcudart.so.13` / vLLM import fails
+
+Symptoms: `ImportError: libcudart.so.13`, vllm loaded from `~/.local/lib/python3.13/...`.
+
+```bash
+cd ~/private/cse151b_competition/cse151b_competition
+source scripts/server/activate_vllm.sh   # sets PYTHONNOUSERSITE=1 + CUDA libs
+bash scripts/server/diagnose_vllm.sh
+bash scripts/server/test_installs.sh
+```
+
+If diagnose still fails on a GPU node, load your cluster CUDA module (example):
+
+```bash
+module avail cuda 2>/dev/null | head
+module load cuda/13.0   # name varies by site
+source scripts/server/activate_vllm.sh
+bash scripts/server/diagnose_vllm.sh
+```
+
+Then re-run eval:
+
+```bash
+STAGE2_ROOT=workspaces/stage2_adapt_v2 bash scripts/server/run_stage2_eval_sweep.sh
 ```
 
 ## Test installs (run anytime)

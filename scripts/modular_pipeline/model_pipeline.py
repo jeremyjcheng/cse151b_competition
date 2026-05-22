@@ -159,7 +159,10 @@ class ModularPipeline:
             from vllm.lora.request import LoRARequest  # type: ignore
         except Exception as exc:
             raise RuntimeError(
-                "vLLM is required for inference. Install `vllm` and optionally `bitsandbytes`."
+                "vLLM is required for inference. "
+                f"Import failed ({type(exc).__name__}: {exc}). "
+                "Use conda env vllm (source scripts/server/activate_vllm.sh) and "
+                "run: python -c \"from vllm.lora.request import LoRARequest\"."
             ) from exc
 
         llm_kwargs: dict[str, Any] = dict(
