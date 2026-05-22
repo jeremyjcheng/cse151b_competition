@@ -116,17 +116,18 @@ FINAL_ANSWER_CUE_WINDOW_CHARS = 600
 # Optional n-gram blocking
 # ============================================================
 
-# Disabled because it can interfere with math reasoning and option comparison.
+# Keep MCQ disabled; enable a small value for free-form to prevent phrase loops.
 NO_REPEAT_NGRAM_SIZE_MCQ = 0
 NO_REPEAT_NGRAM_SIZE_MCQ_FINAL = 0
-NO_REPEAT_NGRAM_SIZE_FREE = 0
+NO_REPEAT_NGRAM_SIZE_FREE = 8
 
 
 # ============================================================
 # Free-form generation settings
 # ============================================================
 
-MAX_TOKENS_FREE = 8192
+# Limit long free-form runaway loops while leaving room for multi-part answers.
+MAX_TOKENS_FREE = 3072
 
 # Ignored by vLLM backend, kept for compatibility with older HF path.
 THINK_BUDGET_FREE = 0
@@ -135,7 +136,7 @@ THINK_BUDGET_FREE = 0
 TEMP_FREE = 0.1
 TOP_P_FREE = 0.9
 TOP_K_FREE = 10
-REP_PEN_FREE = 1.05
+REP_PEN_FREE = 1.10
 
 
 # ============================================================
@@ -151,7 +152,7 @@ FREE_BATCH_SIZE = 2
 
 ENABLE_THINKING_MCQ_PRIMARY = True
 ENABLE_THINKING_MCQ_FINAL = False
-ENABLE_THINKING_FREE = True
+ENABLE_THINKING_FREE = False
 
 # ============================================================
 # Prompts
@@ -174,6 +175,7 @@ SYSTEM_PROMPT_FREE = (
     "Do not box intermediate answers. "
     "If multiple [ANS] slots exist, output exactly that many values "
     "inside a single \\boxed{...}, comma-separated. "
+    "Do not repeat the same sentence or answer text. "
     "After the final boxed answer, stop."
 )
 

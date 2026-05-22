@@ -89,6 +89,12 @@ _TRAINING_ECHO_PATTERNS = (
     "\\begin{solution}",
 )
 
+_MCQ_UNCERTAINTY_RE = re.compile(
+    r"\b(?:none\s+of\s+the\s+options|closest\s+option|might\s+be\s+a\s+mistake|"
+    r"not\s+sure|cannot\s+determine|unclear)\b",
+    re.IGNORECASE,
+)
+
 _VLLM_ARG_UNSET = object()
 
 
@@ -113,6 +119,36 @@ def _extract_last_valid_letter(text: str, labels: list[str]) -> str:
             candidates.append(cand)
 
     return candidates[-1] if candidates else ""
+
+
+def _should_force_mcq_finalizer(raw_text: str, labels: list[str]) -> bool:
+    """Return True when primary MCQ extraction should defer to finalizer."""
+    spans = iter_boxed_spans(raw_text)
+    if not spans:
+        return True
+
+    valid = {str(label).strip().upper() for label in labels}
+    valid_letter_spans = 0
+    nonletter_boxed = 0
+
+    for _start, _end, inner in spans:
+        if _mcq_letter_from_boxed_inner(inner, valid):
+            valid_letter_spans += 1
+        elif str(inner or "").strip():
+            nonletter_boxed += 1
+
+    # Multiple boxed segments or boxed non-letters usually indicate noisy raw
+    # output where direct "last valid letter" can be brittle.
+    if len(spans) != 1:
+        return True
+    if nonletter_boxed > 0:
+        return True
+    if valid_letter_spans != 1:
+        return True
+
+    if _MCQ_UNCERTAINTY_RE.search(raw_text):
+        return True
+    return False
 
 
 def _apply_vllm_quantization_kwargs(
@@ -455,7 +491,7 @@ class ModularPipeline:
         if mcq_valid is not None:
             valid_upper = {str(x).strip().upper() for x in mcq_valid}
 
-            valid_spans = []
+            valid_spans: list[tuple[int, int, bool]] = []
             for start, end, inner in spans:
                 cand = _mcq_letter_from_boxed_inner(inner, valid_upper)
                 if not cand:
@@ -466,12 +502,18 @@ class ModularPipeline:
                 if prefix_tokens < MIN_TOKENS_BEFORE_BOXED_STOP:
                     continue
 
-                valid_spans.append((start, end))
+                cue_window = max(0, int(FINAL_ANSWER_CUE_WINDOW_CHARS))
+                context_start = max(0, start - cue_window)
+                context = raw_clean[context_start:start]
+                cue_hit = bool(_FINAL_CUE_RE.search(context))
+                valid_spans.append((start, end, cue_hit))
 
             if valid_spans:
-                # Pick earliest valid final-answer box after the minimum token threshold.
-                # This avoids long post-answer loops on MCQ outputs.
-                _start, end = valid_spans[0]
+                # Prefer a cue-aligned final answer box; otherwise keep the last
+                # valid boxed letter so mid-reasoning tentative choices do not win.
+                cue_spans = [span for span in valid_spans if span[2]]
+                chosen = cue_spans[-1] if cue_spans else valid_spans[-1]
+                _start, end, _cue_hit = chosen
                 if post_box_patience_tokens > 0:
                     suffix = raw_clean[end:]
                     suffix_tokens = self.tokenizer.encode(suffix, add_special_tokens=False)
@@ -883,39 +925,44 @@ class ModularPipeline:
             primary_pre_truncs.append(raw_pre)
 
             if letter:
-                response = mcq_canonical_response(letter)
-                phrase_only = extractor_path_primary in (
-                    "mcq_primary_phrase_fulltext",
-                    "mcq_primary_pre_trunc_phrase",
-                )
-                solved[idx] = {
-                    "response": response,
-                    "raw": raw,
-                    "meta": self._mcq_build_meta(
-                        primary_raw=raw,
-                        response=response,
-                        n_tokens=out["n_tokens"],
-                        finalizer_used=False,
-                        option_match_used=False,
-                        extractor_path=extractor_path_primary,
-                        fallback_used=phrase_only,
-                        malformed=False,
-                        malformed_reason="",
-                        boxed_in_raw=boxed_in_raw,
-                        training_echo_detected=echo,
-                        pre_trunc_n_tokens=out.get("pre_trunc_n_tokens"),
-                        generation_hit_max=out.get("generation_hit_max"),
-                        raw_was_post_truncated=bool(out.get("raw_was_post_truncated", False)),
-                        confidence_tier=(
-                            "boxed_high"
-                            if extractor_path_primary
-                            in ("mcq_last_valid_letter", "mcq_primary_pre_trunc_last_valid_letter")
-                            else "answer_phrase_medium"
+                force_finalizer = _should_force_mcq_finalizer(raw, labels)
+                if not force_finalizer:
+                    response = mcq_canonical_response(letter)
+                    phrase_only = extractor_path_primary in (
+                        "mcq_primary_phrase_fulltext",
+                        "mcq_primary_pre_trunc_phrase",
+                    )
+                    solved[idx] = {
+                        "response": response,
+                        "raw": raw,
+                        "meta": self._mcq_build_meta(
+                            primary_raw=raw,
+                            response=response,
+                            n_tokens=out["n_tokens"],
+                            finalizer_used=False,
+                            option_match_used=False,
+                            extractor_path=extractor_path_primary,
+                            fallback_used=phrase_only,
+                            malformed=False,
+                            malformed_reason="",
+                            boxed_in_raw=boxed_in_raw,
+                            training_echo_detected=echo,
+                            pre_trunc_n_tokens=out.get("pre_trunc_n_tokens"),
+                            generation_hit_max=out.get("generation_hit_max"),
+                            raw_was_post_truncated=bool(out.get("raw_was_post_truncated", False)),
+                            confidence_tier=(
+                                "boxed_high"
+                                if extractor_path_primary
+                                in ("mcq_last_valid_letter", "mcq_primary_pre_trunc_last_valid_letter")
+                                else "answer_phrase_medium"
+                            ),
+                            guessed_letter_used=phrase_only,
+                            finalizer_extractor_path="",
                         ),
-                        guessed_letter_used=phrase_only,
-                        finalizer_extractor_path="",
-                    ),
-                }
+                    }
+                else:
+                    finalizer_items.append(item)
+                    finalizer_indices.append(idx)
             else:
                 finalizer_items.append(item)
                 finalizer_indices.append(idx)
@@ -947,6 +994,8 @@ class ModularPipeline:
                     "Raw model output to extract from:\n"
                     f"{raw_for_finalizer}\n\n"
                     "Return exactly one boxed letter: \\boxed{X}, where X is one valid choice. "
+                    "If raw includes a boxed non-letter value (e.g. \\boxed{601}), map that value "
+                    "to the matching option text and return that option letter. "
                     "If multiple letters appear, use the final supported choice in the raw text. "
                     "Do not output explanation or any extra text."
                 )
