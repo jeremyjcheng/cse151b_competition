@@ -13,7 +13,7 @@ def build_mcq_user(question: str, options: list[str]) -> str:
         f"Q: {question}\n\n"
         f"Options:\n{opts_text}\n\n"
         f"Valid choices: [{valid_letters}].\n"
-        "Think briefly. Do not write a full derivation. Compare the options and choose the "
+        "Think step by step, but keep it concise. Compare the options and choose the "
         "best answer. End with exactly one boxed option letter like \\boxed{A}. "
         "Do not output anything after the boxed letter."
     )

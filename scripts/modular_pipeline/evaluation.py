@@ -8,7 +8,12 @@ from typing import Optional
 from tqdm import tqdm
 
 from formatting_diagnostics import score_output
-from text_processing import extract_all_boxed, extract_valid_letter, iter_boxed_spans
+from text_processing import (
+    canonicalize_free_response_with_meta,
+    extract_all_boxed,
+    extract_valid_letter,
+    iter_boxed_spans,
+)
 
 
 def _has_exactly_one_valid_mcq_box(text: str, labels: list[str]) -> bool:
@@ -109,6 +114,8 @@ def evaluate_with_judger(data: list[dict], records_by_id: dict) -> None:
     mcq_avg_tokens_count = 0
     mcq_repetition_loop_detected = 0
     mcq_boxed_count_gt1_raw = 0
+    free_recanon_fixes = 0
+    free_recanon_regressions = 0
     recovery_path_counts: dict[str, int] = {}
     extractor_total: dict[str, int] = {}
     extractor_correct: dict[str, int] = {}
@@ -206,6 +213,18 @@ def evaluate_with_judger(data: list[dict], records_by_id: dict) -> None:
         else:
             free_total += 1
             free_correct += int(ok)
+            raw_text = str(rec.get("raw") or meta.get("raw") or "")
+            question = str(item.get("question") or "")
+            if raw_text and question:
+                pred_recanon, _ = canonicalize_free_response_with_meta(raw_text, question=question)
+                recanon_ok = _safe_auto_judge(
+                    judger,
+                    pred=pred_recanon,
+                    gold=gold,
+                    options_per_slot=options_per_slot,
+                )
+                free_recanon_fixes += int((not ok) and recanon_ok)
+                free_recanon_regressions += int(ok and (not recanon_ok))
 
         format_valid_total += int(
             bool(boxed_values)
@@ -294,4 +313,11 @@ def evaluate_with_judger(data: list[dict], records_by_id: dict) -> None:
             correct = extractor_correct.get(path, 0)
             parts.append(f"{path}={correct}/{total} ({acc(correct, total):.1f}%)")
         print("  Extractor path accuracy: " + ", ".join(parts))
+    if free_total:
+        print(
+            "  Free re-canonicalization: "
+            f"fixes={free_recanon_fixes}/{free_total} ({acc(free_recanon_fixes, free_total):.2f}%), "
+            f"regressions={free_recanon_regressions}/{free_total} "
+            f"({acc(free_recanon_regressions, free_total):.2f}%)"
+        )
     print("=" * 50)

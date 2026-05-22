@@ -337,6 +337,43 @@ def _last_answer_phrase(text: str) -> str:
     return nums[-1] if nums else ""
 
 
+def _count_ans_slots(question: str | None) -> int:
+    if not question:
+        return 0
+    return str(question).count("[ANS]")
+
+
+def _split_comma_values(text: str) -> list[str]:
+    if not text:
+        return []
+    parts = [p.strip().strip(".,:; \t") for p in str(text).split(",")]
+    return [p for p in parts if p]
+
+
+def _extract_multi_answer_values_from_phrase(text: str, expected_slots: int) -> list[str]:
+    if expected_slots < 2 or not text:
+        return []
+
+    patterns = (
+        r"(?:final\s+)?answers?\s*(?:are|is)[:\s]+([^\n]+)",
+        r"(?:therefore|thus|hence|so)[,]?\s+([^\n]+)",
+    )
+    candidate = ""
+    for pat in patterns:
+        matches = re.findall(pat, text, flags=re.IGNORECASE | re.MULTILINE)
+        if matches:
+            candidate = str(matches[-1]).strip()
+            break
+
+    if not candidate:
+        return []
+
+    values = _split_comma_values(candidate)
+    if len(values) != expected_slots:
+        return []
+    return values
+
+
 def canonicalize_mcq_response(response: str, letter: str) -> str:
     """Keep rationale text while enforcing exactly one final \\boxed{X}."""
     normalized_letter = str(letter).strip().upper()
@@ -424,22 +461,26 @@ _FINAL_ANSWER_CUE_PATTERN = re.compile(
 )
 
 
-def canonicalize_free_response(response: str) -> str:
+def canonicalize_free_response(response: str, question: str | None = None) -> str:
     """Return exactly one boxed free-response answer using cue-aware selection."""
-    out, _meta = canonicalize_free_response_with_meta(response)
+    out, _meta = canonicalize_free_response_with_meta(response, question=question)
     return out
 
 
-def canonicalize_free_response_with_meta(response: str) -> tuple[str, dict]:
+def canonicalize_free_response_with_meta(response: str, question: str | None = None) -> tuple[str, dict]:
     """Return canonical single \\boxed{...} plus extractor diagnostics for FRQ."""
     ensured = ensure_boxed(response)
     boxed = _find_boxed_with_values(ensured)
     boxed_inners = [b[2].strip() for b in boxed]
+    expected_ans_slots = _count_ans_slots(question)
     meta: dict = {
         "extractor_path": "free",
         "boxed_count_in_raw": len(boxed),
         "boxed_candidates": boxed_inners,
         "selected_boxed_index": None,
+        "expected_ans_slots": expected_ans_slots,
+        "extracted_values": [],
+        "phrase_override": False,
         "cue_matched": False,
         "fallback_used": False,
         "malformed_output": False,
@@ -451,6 +492,22 @@ def canonicalize_free_response_with_meta(response: str) -> tuple[str, dict]:
         meta["malformed_output"] = True
         meta["malformed_reason"] = "no_boxed_after_ensure"
         return ensure_boxed("\\boxed{}"), meta
+
+    if expected_ans_slots >= 2:
+        visible = visible_answer_after_think_tags(response)
+        phrase_values = _extract_multi_answer_values_from_phrase(visible, expected_ans_slots)
+        if phrase_values:
+            meta["extractor_path"] = "free_multi_ans_phrase"
+            meta["extracted_values"] = phrase_values
+            meta["phrase_override"] = True
+            return f"\\boxed{{{', '.join(phrase_values)}}}", meta
+
+        boxed_values = _split_comma_values(boxed[-1][2].strip())
+        if len(boxed_values) == expected_ans_slots:
+            meta["extractor_path"] = "free_multi_ans_last_box"
+            meta["selected_boxed_index"] = len(boxed) - 1
+            meta["extracted_values"] = boxed_values
+            return f"\\boxed{{{', '.join(boxed_values)}}}", meta
 
     cue_pattern = _FINAL_ANSWER_CUE_PATTERN
     selected_value = boxed[-1][2].strip()

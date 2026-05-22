@@ -1068,9 +1068,12 @@ class ModularPipeline:
 
         solved: list[dict] = []
 
-        for out in outputs:
+        for item, out in zip(items, outputs):
             raw = out["raw"]
-            response, extract_meta = canonicalize_free_response_with_meta(raw)
+            response, extract_meta = canonicalize_free_response_with_meta(
+                raw,
+                question=item.get("question"),
+            )
             boxed_in_raw = extract_meta.get("boxed_candidates") or extract_all_boxed(raw)
 
             solved.append(
@@ -1094,6 +1097,9 @@ class ModularPipeline:
                         "extractor_path": extract_meta.get("extractor_path", "free"),
                         "boxed_count_in_raw": extract_meta.get("boxed_count_in_raw", len(boxed_in_raw)),
                         "selected_boxed_index": extract_meta.get("selected_boxed_index"),
+                        "expected_ans_slots": extract_meta.get("expected_ans_slots", 0),
+                        "extracted_values": extract_meta.get("extracted_values", []),
+                        "phrase_override": extract_meta.get("phrase_override", False),
                         "cue_matched": extract_meta.get("cue_matched", False),
                         "malformed_output": extract_meta.get("malformed_output", False),
                         "malformed_reason": extract_meta.get("malformed_reason", ""),

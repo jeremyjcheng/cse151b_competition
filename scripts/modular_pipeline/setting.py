@@ -6,10 +6,10 @@ MODEL_ID = "Qwen/Qwen3-4B-Thinking-2507"
 # vLLM engine defaults
 # ============================================================
 
-VLLM_GPU_MEMORY_UTILIZATION = 0.70
-VLLM_MAX_MODEL_LEN = 4096
+VLLM_GPU_MEMORY_UTILIZATION = 0.75
+VLLM_MAX_MODEL_LEN = 8192
 VLLM_MAX_NUM_SEQS = 4
-VLLM_MAX_NUM_BATCHED_TOKENS = 4096
+VLLM_MAX_NUM_BATCHED_TOKENS = 8192
 VLLM_QUANTIZATION = "bitsandbytes"
 VLLM_LOAD_FORMAT = "bitsandbytes"
 
