@@ -350,6 +350,31 @@ def _split_comma_values(text: str) -> list[str]:
     return [p for p in parts if p]
 
 
+def _normalize_multi_answer_candidate(candidate: str) -> str:
+    """Normalize phrase candidate before comma-splitting.
+
+    Handles wrappers like ``\\[ ... \\]`` and prefers inner ``\\boxed{...}``
+    content when present so we avoid emitting nested boxed responses.
+    """
+    s = str(candidate or "").strip().strip(".,:; \t")
+    if not s:
+        return ""
+
+    # Strip common display-math wrappers.
+    s = re.sub(r"^\\\[\s*", "", s)
+    s = re.sub(r"\s*\\\]$", "", s)
+    s = re.sub(r"^\$\$(.*)\$\$$", r"\1", s, flags=re.DOTALL)
+    s = re.sub(r"^\$(.*)\$$", r"\1", s, flags=re.DOTALL)
+    s = s.strip().strip(".,:; \t")
+
+    # If candidate includes boxed math, prefer the last boxed inner content.
+    boxed = _find_boxed_with_values(s)
+    if boxed:
+        s = boxed[-1][2].strip()
+
+    return s.strip().strip(".,:; \t")
+
+
 def _extract_multi_answer_values_from_phrase(text: str, expected_slots: int) -> list[str]:
     if expected_slots < 2 or not text:
         return []
@@ -368,7 +393,7 @@ def _extract_multi_answer_values_from_phrase(text: str, expected_slots: int) -> 
     if not candidate:
         return []
 
-    values = _split_comma_values(candidate)
+    values = _split_comma_values(_normalize_multi_answer_candidate(candidate))
     if len(values) != expected_slots:
         return []
     return values

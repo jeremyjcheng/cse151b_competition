@@ -82,7 +82,7 @@ STAGE2_TRAIN_LIMIT_FREE = 25
 # ============================================================
 
 # Room to finish reasoning and emit a final \\boxed{X} (truncation hurts correctness).
-MAX_TOKENS_MCQ = 4096
+MAX_TOKENS_MCQ = 6144
 
 # Ignored by vLLM backend, kept for compatibility with older HF path.
 THINK_BUDGET_MCQ = 0
@@ -104,7 +104,7 @@ REP_PEN_MCQ_FINAL = 1.0
 # Stop / truncation settings
 # ============================================================
 
-MIN_TOKENS_BEFORE_BOXED_STOP = 64
+MIN_TOKENS_BEFORE_BOXED_STOP = 256
 
 POST_BOX_PATIENCE_TOKENS_FREE = 256
 POST_BOX_PATIENCE_TOKENS_MCQ = 0
@@ -168,7 +168,7 @@ SYSTEM_PROMPT_MCQ = (
 
 SYSTEM_PROMPT_FREE = (
     "You are an expert mathematician solving a timed exam. "
-    "Reason briefly and efficiently. "
+    "Reason step by step, then give one final answer. "
     "Avoid repeating the same step. "
     "End with exactly one final \\boxed{...}. "
     "Do not box intermediate answers. "
