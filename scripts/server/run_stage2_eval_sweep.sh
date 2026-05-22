@@ -18,6 +18,12 @@ if [[ ! -f "$HOLDOUT" ]]; then
 fi
 
 LOG_FILE="${LOG_DIR}/stage2_eval_sweep.log"
+
+if [[ ! -x "$PY" ]]; then
+  echo "ERROR: PY is not an executable: $PY" >&2
+  exit 1
+fi
+
 echo "Python: $PY"
 echo "Log:    $LOG_FILE"
 

@@ -102,7 +102,20 @@ if ! _activate_conda; then
   fi
 fi
 
-export PY="$(command -v python)"
+# Prefer explicit env python (command -v can return a directory on some conda setups).
+if [[ -x "${CONDA_PREFIX}/bin/python" ]]; then
+  export PY="${CONDA_PREFIX}/bin/python"
+elif [[ -x "${CONDA_PREFIX}/bin/python3" ]]; then
+  export PY="${CONDA_PREFIX}/bin/python3"
+else
+  export PY="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
+fi
+
+if [[ -z "${PY:-}" || ! -f "$PY" || ! -x "$PY" ]]; then
+  echo "ERROR: Could not resolve a python executable (got: ${PY:-empty})"
+  echo "  CONDA_PREFIX=${CONDA_PREFIX:-unset}"
+  return 1
+fi
 
 case "$PY" in
   *"/.venv/"*)
