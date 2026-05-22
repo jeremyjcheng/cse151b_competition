@@ -313,10 +313,12 @@ def main() -> None:
                 "id": qid,
                 "question": item.get("question"),
                 "options": item.get("options"),
+                "is_mcq": True,
                 "prompt": "",
                 "target": f"\\boxed{{{gold_letter}}}",
                 "gold_letter": gold_letter,
                 "extracted_letter": extracted_letter,
+                "accepted_raw": raw,
                 "raw_candidate": raw,
                 "response": response,
                 "sample_index": sample_index,
@@ -388,6 +390,7 @@ def main() -> None:
             normalized_response = f"\\boxed{{{extracted_letter}}}"
             normalized_tokens = _token_count_approx(normalized_raw)
             accepted = dict(candidate)
+            accepted["accepted_raw"] = normalized_raw
             accepted["raw_candidate"] = normalized_raw
             accepted["response"] = normalized_response
             accepted["extracted_letter"] = extracted_letter

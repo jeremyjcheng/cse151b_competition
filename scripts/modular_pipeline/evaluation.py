@@ -1,6 +1,7 @@
 """Judger-based evaluation helpers."""
 
 import importlib.util
+import re
 import signal
 from pathlib import Path
 from typing import Optional
@@ -14,6 +15,32 @@ from text_processing import (
     extract_valid_letter,
     iter_boxed_spans,
 )
+
+
+_STEP_PATTERN = re.compile(r"\bstep\s+\d+\b", re.IGNORECASE)
+_SURFACE_PATTERN = re.compile(
+    r"(?:can be solved using|we can use|it follows that|therefore we get)",
+    re.IGNORECASE,
+)
+
+
+def _reasoning_signal_metrics(text: str) -> dict[str, bool]:
+    s = str(text or "")
+    if not s.strip():
+        return {
+            "has_step_structure": False,
+            "has_math_ops": False,
+            "surface_only_claim": False,
+        }
+    step_hits = len(_STEP_PATTERN.findall(s))
+    math_ops = len(re.findall(r"[=+\-*/^\\]", s))
+    digits = len(re.findall(r"\d", s))
+    surface = bool(_SURFACE_PATTERN.search(s))
+    return {
+        "has_step_structure": bool(step_hits >= 2),
+        "has_math_ops": bool(math_ops >= 2 or digits >= 3),
+        "surface_only_claim": bool(surface and math_ops < 2 and digits < 3),
+    }
 
 
 def _has_exactly_one_valid_mcq_box(text: str, labels: list[str]) -> bool:
@@ -114,8 +141,19 @@ def evaluate_with_judger(data: list[dict], records_by_id: dict) -> None:
     mcq_avg_tokens_count = 0
     mcq_repetition_loop_detected = 0
     mcq_boxed_count_gt1_raw = 0
+    mcq_verify_triggered = 0
+    mcq_verify_no_primary = 0
+    mcq_verify_low_confidence = 0
+    mcq_verify_score_sum = 0
+    mcq_verify_score_count = 0
+    mcq_reasoning_steps = 0
+    mcq_reasoning_math_ops = 0
+    mcq_surface_only_claims = 0
     free_recanon_fixes = 0
     free_recanon_regressions = 0
+    free_reasoning_steps = 0
+    free_reasoning_math_ops = 0
+    free_surface_only_claims = 0
     recovery_path_counts: dict[str, int] = {}
     extractor_total: dict[str, int] = {}
     extractor_correct: dict[str, int] = {}
@@ -188,6 +226,16 @@ def evaluate_with_judger(data: list[dict], records_by_id: dict) -> None:
             mcq_avg_tokens_total += int(meta.get("n_tokens") or 0)
             mcq_avg_tokens_count += 1
             mcq_boxed_count_gt1_raw += int(int(meta.get("boxed_count_in_raw") or 0) > 1)
+            verify_triggered = bool(meta.get("verify_triggered"))
+            mcq_verify_triggered += int(verify_triggered)
+            if verify_triggered:
+                reason = str(meta.get("verify_reason") or "")
+                if "no_primary_letter" in reason:
+                    mcq_verify_no_primary += 1
+                else:
+                    mcq_verify_low_confidence += 1
+                mcq_verify_score_sum += int(meta.get("verify_score") or 0)
+                mcq_verify_score_count += 1
 
             rp = str(meta.get("raw_letter_recovery_path") or "")
             if rp:
@@ -206,6 +254,10 @@ def evaluate_with_judger(data: list[dict], records_by_id: dict) -> None:
                 int(diag.get("repeated_boxed_answers", 0)) >= 2
                 or int(diag.get("repeated_phrase_after_box", 0)) >= 2
             )
+            rs = _reasoning_signal_metrics(raw_text or pred)
+            mcq_reasoning_steps += int(rs["has_step_structure"])
+            mcq_reasoning_math_ops += int(rs["has_math_ops"])
+            mcq_surface_only_claims += int(rs["surface_only_claim"])
 
             path = str(meta.get("extractor_path") or "unknown")
             extractor_total[path] = extractor_total.get(path, 0) + 1
@@ -225,6 +277,10 @@ def evaluate_with_judger(data: list[dict], records_by_id: dict) -> None:
                 )
                 free_recanon_fixes += int((not ok) and recanon_ok)
                 free_recanon_regressions += int(ok and (not recanon_ok))
+            rs = _reasoning_signal_metrics(raw_text or pred)
+            free_reasoning_steps += int(rs["has_step_structure"])
+            free_reasoning_math_ops += int(rs["has_math_ops"])
+            free_surface_only_claims += int(rs["surface_only_claim"])
 
         format_valid_total += int(
             bool(boxed_values)
@@ -294,9 +350,26 @@ def evaluate_with_judger(data: list[dict], records_by_id: dict) -> None:
             f"({acc(mcq_repetition_loop_detected, mcq_total):.2f}%)"
         )
         print(
+            "  MCQ verify    : "
+            f"triggered={mcq_verify_triggered}/{mcq_total} "
+            f"({acc(mcq_verify_triggered, mcq_total):.2f}%), "
+            f"no_primary={mcq_verify_no_primary}/{mcq_total} "
+            f"({acc(mcq_verify_no_primary, mcq_total):.2f}%), "
+            f"low_confidence={mcq_verify_low_confidence}/{mcq_total} "
+            f"({acc(mcq_verify_low_confidence, mcq_total):.2f}%), "
+            f"avg_verify_score={(mcq_verify_score_sum / mcq_verify_score_count) if mcq_verify_score_count else 0.0:.2f}"
+        )
+        print(
             "  MCQ raw shape : "
             f"boxed_count_in_raw>1={mcq_boxed_count_gt1_raw}/{mcq_total} "
             f"({acc(mcq_boxed_count_gt1_raw, mcq_total):.2f}%)"
+        )
+        print(
+            "  MCQ reasoning : "
+            f"step_structure={mcq_reasoning_steps}/{mcq_total} ({acc(mcq_reasoning_steps, mcq_total):.2f}%), "
+            f"math_ops={mcq_reasoning_math_ops}/{mcq_total} ({acc(mcq_reasoning_math_ops, mcq_total):.2f}%), "
+            f"surface_only_claims={mcq_surface_only_claims}/{mcq_total} "
+            f"({acc(mcq_surface_only_claims, mcq_total):.2f}%)"
         )
     if extractor_counts:
         top_paths = sorted(extractor_counts.items(), key=lambda x: -x[1])[:12]
@@ -319,5 +392,12 @@ def evaluate_with_judger(data: list[dict], records_by_id: dict) -> None:
             f"fixes={free_recanon_fixes}/{free_total} ({acc(free_recanon_fixes, free_total):.2f}%), "
             f"regressions={free_recanon_regressions}/{free_total} "
             f"({acc(free_recanon_regressions, free_total):.2f}%)"
+        )
+        print(
+            "  Free reasoning: "
+            f"step_structure={free_reasoning_steps}/{free_total} ({acc(free_reasoning_steps, free_total):.2f}%), "
+            f"math_ops={free_reasoning_math_ops}/{free_total} ({acc(free_reasoning_math_ops, free_total):.2f}%), "
+            f"surface_only_claims={free_surface_only_claims}/{free_total} "
+            f"({acc(free_surface_only_claims, free_total):.2f}%)"
         )
     print("=" * 50)

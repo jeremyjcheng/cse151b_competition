@@ -348,6 +348,89 @@ def _extract_final_answer_from_row(row: dict) -> str:
     return ""
 
 
+_TOOL_TRACE_PATTERN = re.compile(
+    r"(?:tool\s+available:|python\s+interpreter|wikipedia_search\(|\bpage:\s)",
+    re.IGNORECASE,
+)
+_THINK_TAG_PATTERN = re.compile(r"</?think>", re.IGNORECASE)
+_FENCED_CODE_PATTERN = re.compile(r"```[\s\S]*?```", re.IGNORECASE)
+_STEP_PATTERN = re.compile(r"\bstep\s+\d+\b", re.IGNORECASE)
+
+
+def _normalize_reasoning_solution(solution: str) -> str:
+    text = str(solution or "").strip()
+    if not text:
+        return ""
+    text = _THINK_TAG_PATTERN.sub("", text)
+    text = _FENCED_CODE_PATTERN.sub("", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _reasoning_quality_flags(problem: str, solution: str) -> list[str]:
+    p = str(problem or "").strip()
+    s = str(solution or "").strip()
+    if not p or not s:
+        return ["missing_problem_or_solution"]
+
+    lower = s.lower()
+    if _TOOL_TRACE_PATTERN.search(s):
+        return ["tool_trace_or_environment_artifact"]
+    if len(s) < 80:
+        return ["solution_too_short"]
+
+    n_steps = len(_STEP_PATTERN.findall(s))
+    n_math_tokens = len(re.findall(r"[=+\-*/^\\]", s))
+    n_digits = len(re.findall(r"\d", s))
+    if n_steps >= 3 and n_math_tokens < 2 and n_digits < 3:
+        return ["template_steps_without_math"]
+
+    generic_phrases = len(
+        re.findall(
+            r"(?:to solve this problem|we need to|let's solve this|we can start by)",
+            lower,
+        )
+    )
+    if generic_phrases >= 4 and n_math_tokens < 3:
+        return ["generic_surface_reasoning"]
+
+    boxed = extract_all_boxed(s)
+    if len(boxed) > 1:
+        return ["multiple_boxed_in_solution"]
+    return []
+
+
+def _build_reasoning_example(
+    *,
+    problem: str,
+    solution: str,
+    fallback_answer: str,
+    source: str,
+    stats: dict,
+) -> dict | None:
+    normalized = _normalize_reasoning_solution(solution)
+    flags = _reasoning_quality_flags(problem, normalized)
+    if flags:
+        _skip(stats, flags[0])
+        return None
+
+    target = _enforce_single_final_boxed(normalized, fallback_answer=fallback_answer)
+    if len(str(target).strip()) < 60:
+        _skip(stats, "target_too_short_after_canonicalize")
+        return None
+    return {
+        "prompt": build_reasoning_train_user(problem),
+        "target": target,
+        "example_type": "frq",
+        "system_prompt": (
+            "You are an expert competition mathematician. "
+            "Provide concise step-by-step reasoning and finish with exactly one final \\boxed{...}."
+        ),
+        "source": source,
+        "target_kind": TARGET_KIND_REAL_REASONING,
+    }
+
+
 def _load_metamathqa_examples(max_examples: int | None, seed: int) -> tuple[list[dict], dict]:
     try:
         from datasets import load_dataset
@@ -368,23 +451,15 @@ def _load_metamathqa_examples(max_examples: int | None, seed: int) -> tuple[list
         problem = _extract_question_from_row(row)
         solution = _extract_reasoning_solution_from_row(row)
         fallback = _extract_final_answer_from_row(row)
-        if not problem or not solution:
-            _skip(stats, "missing_problem_or_solution")
-            continue
-        target = _enforce_single_final_boxed(solution, fallback_answer=fallback)
-        examples.append(
-            {
-                "prompt": build_reasoning_train_user(problem),
-                "target": target,
-                "example_type": "frq",
-                "system_prompt": (
-                    "You are an expert competition mathematician. "
-                    "Provide concise step-by-step reasoning and finish with exactly one final \\boxed{...}."
-                ),
-                "source": "metamathqa",
-                "target_kind": TARGET_KIND_REAL_REASONING,
-            }
+        ex = _build_reasoning_example(
+            problem=problem,
+            solution=solution,
+            fallback_answer=fallback,
+            source="metamathqa",
+            stats=stats,
         )
+        if ex is not None:
+            examples.append(ex)
     return examples, _finalize_stats(stats, len(examples))
 
 
@@ -413,23 +488,15 @@ def _load_numinamath_cot_examples(
         problem = _extract_question_from_row(row)
         solution = _extract_reasoning_solution_from_row(row)
         fallback = _extract_final_answer_from_row(row)
-        if not problem or not solution:
-            _skip(stats, "missing_problem_or_solution")
-            continue
-        target = _enforce_single_final_boxed(solution, fallback_answer=fallback)
-        examples.append(
-            {
-                "prompt": build_reasoning_train_user(problem),
-                "target": target,
-                "example_type": "frq",
-                "system_prompt": (
-                    "You are an expert competition mathematician. "
-                    "Provide concise step-by-step reasoning and finish with exactly one final \\boxed{...}."
-                ),
-                "source": "numinamath_cot",
-                "target_kind": TARGET_KIND_REAL_REASONING,
-            }
+        ex = _build_reasoning_example(
+            problem=problem,
+            solution=solution,
+            fallback_answer=fallback,
+            source="numinamath_cot",
+            stats=stats,
         )
+        if ex is not None:
+            examples.append(ex)
     return examples, _finalize_stats(stats, len(examples))
 
 
@@ -452,23 +519,15 @@ def _load_openmath_examples(max_examples: int | None, seed: int) -> tuple[list[d
         problem = str(row.get("problem", "")).strip()
         solution = str(row.get("generated_solution", "")).strip()
         expected = str(row.get("expected_answer", "")).strip()
-        if not problem or not solution:
-            _skip(stats, "missing_problem_or_solution")
-            continue
-        target = _enforce_single_final_boxed(solution, fallback_answer=expected)
-        examples.append(
-            {
-                "prompt": build_reasoning_train_user(problem),
-                "target": target,
-                "example_type": "frq",
-                "system_prompt": (
-                    "You are an expert competition mathematician. "
-                    "Provide concise step-by-step reasoning and finish with exactly one final \\boxed{...}."
-                ),
-                "source": "openmath",
-                "target_kind": TARGET_KIND_REAL_REASONING,
-            }
+        ex = _build_reasoning_example(
+            problem=problem,
+            solution=solution,
+            fallback_answer=expected,
+            source="openmath",
+            stats=stats,
         )
+        if ex is not None:
+            examples.append(ex)
     return examples, _finalize_stats(stats, len(examples))
 
 
@@ -503,23 +562,95 @@ def _load_hendrycks_examples(
     for row in merged:
         problem = str(row.get("problem", "")).strip()
         solution = str(row.get("solution", "")).strip()
-        if not problem or not solution:
-            _skip(stats, "missing_problem_or_solution")
-            continue
-        target = _enforce_single_final_boxed(solution)
-        examples.append(
-            {
-                "prompt": build_reasoning_train_user(problem),
-                "target": target,
-                "example_type": "frq",
-                "system_prompt": (
-                    "You are an expert competition mathematician. "
-                    "Provide concise step-by-step reasoning and finish with exactly one final \\boxed{...}."
-                ),
-                "source": "hendrycks",
-                "target_kind": TARGET_KIND_REAL_REASONING,
-            }
+        ex = _build_reasoning_example(
+            problem=problem,
+            solution=solution,
+            fallback_answer="",
+            source="hendrycks",
+            stats=stats,
         )
+        if ex is not None:
+            examples.append(ex)
+    return examples, _finalize_stats(stats, len(examples))
+
+
+def _load_orca_math_examples(
+    max_examples: int | None,
+    seed: int,
+) -> tuple[list[dict], dict]:
+    try:
+        from datasets import load_dataset
+    except Exception as exc:
+        raise RuntimeError(
+            "Stage `reasoning` requires `datasets`. Install with `pip install datasets`."
+        ) from exc
+
+    ds = load_dataset("microsoft/orca-math-word-problems-200k", split="train")
+    stats = _new_dataset_stats("orca_math")
+    stats["schema"] = _print_dataset_schema("orca_math", "train", ds, dict(ds[0]) if len(ds) else None)
+    rows = [dict(row) for row in ds]
+    stats["loaded"] = len(rows)
+    rows = _sample_cap(rows, max_examples, seed)
+
+    examples: list[dict] = []
+    for row in rows:
+        problem = str(row.get("question", "")).strip()
+        solution = str(row.get("answer", "")).strip()
+        ex = _build_reasoning_example(
+            problem=problem,
+            solution=solution,
+            fallback_answer="",
+            source="orca_math",
+            stats=stats,
+        )
+        if ex is not None:
+            examples.append(ex)
+    return examples, _finalize_stats(stats, len(examples))
+
+
+def _load_ultrainteract_math_examples(
+    max_examples: int | None,
+    seed: int,
+) -> tuple[list[dict], dict]:
+    try:
+        from datasets import load_dataset
+    except Exception as exc:
+        raise RuntimeError(
+            "Stage `reasoning` requires `datasets`. Install with `pip install datasets`."
+        ) from exc
+
+    ds = load_dataset("openbmb/UltraInteract_sft", split="train")
+    stats = _new_dataset_stats("ultrainteract_math")
+    stats["schema"] = _print_dataset_schema(
+        "ultrainteract_math", "train", ds, dict(ds[0]) if len(ds) else None
+    )
+    rows = [dict(row) for row in ds]
+    stats["loaded"] = len(rows)
+
+    # Keep only math traces; coding/logic interaction traces hurt this task.
+    rows = [
+        row
+        for row in rows
+        if str(row.get("task", "")).strip() in {"Math_Cot", "Math_PoT"}
+    ]
+    rows = _sample_cap(rows, max_examples, seed)
+
+    examples: list[dict] = []
+    for row in rows:
+        problem = str(row.get("instruction", "")).strip()
+        solution = str(row.get("response", "")).strip()
+        if not problem:
+            _skip(stats, "missing_instruction")
+            continue
+        ex = _build_reasoning_example(
+            problem=problem,
+            solution=solution,
+            fallback_answer="",
+            source="ultrainteract_math",
+            stats=stats,
+        )
+        if ex is not None:
+            examples.append(ex)
     return examples, _finalize_stats(stats, len(examples))
 
 
@@ -843,6 +974,7 @@ def _load_base_replay_examples(
         response = str(row.get("response", "")).strip()
         meta = row.get("meta") or {}
         raw_trace = str(row.get("raw") or meta.get("raw") or "").strip()
+        canonical_raw_trace = _normalize_reasoning_solution(raw_trace)
         if not response and not raw_trace:
             _skip(stats, "missing_response")
             continue
@@ -896,7 +1028,7 @@ def _load_base_replay_examples(
                 continue
             labels = [chr(65 + i) for i in range(len(options))]
             gold_letter = _normalize_mcq_answer(ref_item) if ref_item.get("answer") else ""
-            trace_for_letter = raw_trace or response
+            trace_for_letter = canonical_raw_trace or response
             letter = extract_valid_letter(trace_for_letter, labels)
             if not letter and gold_letter:
                 letter = gold_letter
@@ -912,10 +1044,14 @@ def _load_base_replay_examples(
                 if isinstance(n_tok, (int, float)) and n_tok < mcq_replay_min_tokens:
                     _skip(stats, "replay_trace_too_short")
                     continue
-                if not raw_trace:
+                if not canonical_raw_trace:
                     _skip(stats, "replay_missing_raw_trace")
                     continue
-                target = _enforce_single_final_boxed(raw_trace, fallback_answer=letter)
+                quality_flags = _reasoning_quality_flags(question, canonical_raw_trace)
+                if quality_flags and quality_flags[0] != "multiple_boxed_in_solution":
+                    _skip(stats, quality_flags[0])
+                    continue
+                target = _enforce_single_final_boxed(canonical_raw_trace, fallback_answer=letter)
                 if not _is_valid_mcq_full_trace_target(target, letter):
                     _skip(stats, "invalid_replay_mcq_full_trace_target")
                     continue
@@ -977,12 +1113,16 @@ def _load_rejection_replay_examples(
     if not rows:
         return [], _finalize_stats(stats, 0)
 
-    required = {"question", "accepted_raw", "is_mcq", "filter_passed"}
-    missing = sorted(list(required - set(rows[0].keys())))
-    if missing:
+    required_any = {"question", "filter_passed"}
+    missing = sorted(list(required_any - set(rows[0].keys())))
+    has_trace_field = any(
+        key in rows[0] for key in ("accepted_raw", "raw_candidate", "raw", "response")
+    )
+    if missing or not has_trace_field:
+        extra = [] if has_trace_field else ["accepted_raw|raw_candidate|raw|response"]
         raise SystemExit(
             "Rejection replay schema incompatible: "
-            f"missing keys={missing}, first_row_keys={stats['schema']['first_row_keys']}"
+            f"missing keys={missing + extra}, first_row_keys={stats['schema']['first_row_keys']}"
         )
 
     rows = _sample_cap(rows, max_examples, seed)
@@ -996,24 +1136,40 @@ def _load_rejection_replay_examples(
         if not question:
             _skip(stats, "missing_question")
             continue
-        accepted_raw = str(row.get("accepted_raw") or "").strip()
+        accepted_raw = str(
+            row.get("accepted_raw")
+            or row.get("raw_candidate")
+            or row.get("raw")
+            or row.get("response")
+            or ""
+        ).strip()
         if not accepted_raw:
             _skip(stats, "missing_accepted_raw")
             continue
+        canonical_raw = _normalize_reasoning_solution(accepted_raw)
+        if not canonical_raw:
+            _skip(stats, "empty_after_normalize")
+            continue
 
-        is_mcq = bool(row.get("is_mcq"))
-        boxed_values = extract_all_boxed(accepted_raw)
+        options = _normalize_options(row.get("options"))
+        is_mcq = bool(row.get("is_mcq", bool(options)))
+        boxed_values = extract_all_boxed(canonical_raw)
         if len(boxed_values) != 1 or not str(boxed_values[0]).strip():
             _skip(stats, "invalid_boxed_shape")
             continue
+        quality_flags = _reasoning_quality_flags(question, canonical_raw)
+        if quality_flags:
+            keepable_mcq_flags = {"multiple_boxed_in_solution"}
+            if (not is_mcq) or quality_flags[0] not in keepable_mcq_flags:
+                _skip(stats, quality_flags[0])
+                continue
 
         if is_mcq:
-            options = _normalize_options(row.get("options"))
             if len(options) < 2:
                 _skip(stats, "missing_options_for_mcq")
                 continue
             labels = [chr(65 + i) for i in range(len(options))]
-            letter = extract_valid_letter(accepted_raw, labels)
+            letter = extract_valid_letter(canonical_raw, labels)
             if not letter:
                 _skip(stats, "missing_or_invalid_mcq_letter")
                 continue
@@ -1023,7 +1179,7 @@ def _load_rejection_replay_examples(
             prompt = build_reasoning_train_user(question)
             example_type = "frq"
 
-        target = _enforce_single_final_boxed(accepted_raw)
+        target = _enforce_single_final_boxed(canonical_raw)
         examples.append(
             {
                 "prompt": prompt,
@@ -1308,14 +1464,17 @@ def _apply_stage_hparam_defaults(args) -> None:
                 getattr(args, "include_numinamath_cot", False),
                 getattr(args, "include_openmath", False),
                 getattr(args, "include_hendrycks", False),
+                getattr(args, "include_orca_math", False),
+                getattr(args, "include_ultrainteract_math", False),
             )
         )
         if not reasoning_dataset_selected:
             args.include_metamathqa = True
             args.include_numinamath_cot = True
+            args.include_orca_math = True
             print(
                 "No reasoning dataset flag provided; defaulting to "
-                "--include-metamathqa and --include-numinamath-cot."
+                "--include-metamathqa, --include-numinamath-cot, and --include-orca-math."
             )
 
     if args.stage == "reasoning":
@@ -1328,17 +1487,24 @@ def _apply_stage_hparam_defaults(args) -> None:
             args.train_on_full_chat = True
         return
 
-    if args.stage in {"mcq", "mixed_reasoning_mcq"}:
+    if args.stage in {"mcq", "mixed_reasoning_mcq", "rejection_sft"}:
         if args.learning_rate >= 2e-4:
             args.learning_rate = ADAPT_DEFAULT_LEARNING_RATE
         if args.max_steps == 500:
-            args.max_steps = REASONING_DEFAULT_MAX_STEPS if args.stage == "mixed_reasoning_mcq" else ADAPT_DEFAULT_MAX_STEPS
+            args.max_steps = (
+                REASONING_DEFAULT_MAX_STEPS
+                if args.stage == "mixed_reasoning_mcq"
+                else ADAPT_DEFAULT_MAX_STEPS
+            )
         if args.train_on_full_chat:
             print(
                 f"Stage `{args.stage}` defaults to concise targets; "
                 "disabling --train-on-full-chat to protect base behavior."
             )
             args.train_on_full_chat = False
+        if args.stage == "rejection_sft" and not args.include_rejection_replay:
+            args.include_rejection_replay = True
+            print("Stage `rejection_sft` auto-enables --include-rejection-replay.")
         if getattr(args, "mcq_target_mode", "letter_only") == "full_trace":
             print(
                 "MCQ target mode `full_trace`: use --include-base-replay with base JSONL `raw` "
@@ -1349,6 +1515,19 @@ def _apply_stage_hparam_defaults(args) -> None:
                     "Warning: --mcq-target-mode full_trace without --include-base-replay "
                     "will not learn real thinking traces from external MCQ datasets."
                 )
+        if getattr(args, "mcq_bridge_short", False):
+            args.include_math_mc = True
+            args.include_compmath_mcq = True
+            if args.rejection_replay_path:
+                args.include_rejection_replay = True
+            args.mcq_example_weight = max(float(args.mcq_example_weight), 1.2)
+            args.rejection_replay_weight = max(float(args.rejection_replay_weight), 1.2)
+            if args.max_steps == ADAPT_DEFAULT_MAX_STEPS or args.max_steps > 200:
+                args.max_steps = 160 if args.stage == "mcq" else 200
+            print(
+                "Enabled short MCQ bridge defaults: math-mc + CompMath-MCQ + rejection replay, "
+                "with conservative max steps."
+            )
         return
 
     if args.stage == "adapt":
@@ -1387,7 +1566,7 @@ def main() -> None:
 
     dataset_stats: dict[str, dict] = {}
     dataset_examples: dict[str, list[dict]] = {}
-    if args.stage in {"reasoning", "mcq", "mixed_reasoning_mcq"}:
+    if args.stage in {"reasoning", "mcq", "mixed_reasoning_mcq", "rejection_sft"}:
         if args.stage == "reasoning" and (args.include_math_mc or args.include_compmath_mcq):
             raise SystemExit(
                 "Stage `reasoning` is FRQ-only. Use --stage mcq or --stage mixed_reasoning_mcq for MCQ datasets."
@@ -1438,6 +1617,26 @@ def main() -> None:
             dataset_examples["hendrycks"] = hendrycks_examples
             dataset_stats["hendrycks"] = hendrycks_stats
             all_examples.extend(hendrycks_examples)
+
+        if args.include_orca_math:
+            print("Loading microsoft/orca-math-word-problems-200k")
+            orca_examples, orca_stats = _load_orca_math_examples(
+                max_examples=args.max_orca_math_examples,
+                seed=args.sample_seed,
+            )
+            dataset_examples["orca_math"] = orca_examples
+            dataset_stats["orca_math"] = orca_stats
+            all_examples.extend(orca_examples)
+
+        if args.include_ultrainteract_math:
+            print("Loading openbmb/UltraInteract_sft (Math_Cot/Math_PoT only)")
+            ultra_examples, ultra_stats = _load_ultrainteract_math_examples(
+                max_examples=args.max_ultrainteract_math_examples,
+                seed=args.sample_seed,
+            )
+            dataset_examples["ultrainteract_math"] = ultra_examples
+            dataset_stats["ultrainteract_math"] = ultra_stats
+            all_examples.extend(ultra_examples)
 
         if args.include_math_mc:
             print("Loading XiangPan/math-mc")
@@ -1498,18 +1697,33 @@ def main() -> None:
             all_examples = [ex for ex in all_examples if ex.get("example_type") == "frq"]
         elif args.stage == "mcq":
             all_examples = [ex for ex in all_examples if ex.get("example_type") == "mcq"]
+        elif args.stage == "rejection_sft":
+            all_examples = [ex for ex in all_examples if ex.get("source") == "rejection_replay"]
 
         all_examples = _mix_examples_with_mcq_weight(
             all_examples,
             mcq_weight=args.mcq_example_weight,
             seed=args.sample_seed,
         )
-        all_examples = _mix_examples_with_source_weight(
-            all_examples,
-            source_name="rejection_replay",
-            weight=float(args.rejection_replay_weight),
-            seed=args.sample_seed,
-        )
+        source_weights = [
+            ("metamathqa", float(args.metamathqa_weight)),
+            ("numinamath_cot", float(args.numinamath_cot_weight)),
+            ("openmath", float(args.openmath_weight)),
+            ("hendrycks", float(args.hendrycks_weight)),
+            ("orca_math", float(args.orca_math_weight)),
+            ("ultrainteract_math", float(args.ultrainteract_math_weight)),
+            ("math_mc", float(args.math_mc_weight)),
+            ("compmath_mcq", float(args.compmath_mcq_weight)),
+            ("base_replay", float(args.base_replay_weight)),
+            ("rejection_replay", float(args.rejection_replay_weight)),
+        ]
+        for source_name, weight in source_weights:
+            all_examples = _mix_examples_with_source_weight(
+                all_examples,
+                source_name=source_name,
+                weight=weight,
+                seed=args.sample_seed,
+            )
         random.Random(args.sample_seed).shuffle(all_examples)
 
         if args.print_dataset_samples:
@@ -1573,6 +1787,10 @@ def main() -> None:
         f"CompMath-MCQ={dataset_stats.get('compmath_mcq', {}).get('accepted', 0)} "
         f"MetaMathQA={dataset_stats.get('metamathqa', {}).get('accepted', 0)} "
         f"NuminaMath-CoT={dataset_stats.get('numinamath_cot', {}).get('accepted', 0)} "
+        f"OpenMath={dataset_stats.get('openmath', {}).get('accepted', 0)} "
+        f"Hendrycks={dataset_stats.get('hendrycks', {}).get('accepted', 0)} "
+        f"Orca-Math={dataset_stats.get('orca_math', {}).get('accepted', 0)} "
+        f"UltraInteract-Math={dataset_stats.get('ultrainteract_math', {}).get('accepted', 0)} "
         f"base replay={dataset_stats.get('base_replay', {}).get('accepted', 0)} "
         f"rejection replay={dataset_stats.get('rejection_replay', {}).get('accepted', 0)}"
     )

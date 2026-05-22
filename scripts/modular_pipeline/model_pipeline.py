@@ -13,6 +13,7 @@ LoRA debugging:
 import os
 import re
 import sys
+import math
 from pathlib import Path
 from typing import Any, Literal
 
@@ -32,6 +33,9 @@ from settings import (
     MAX_TOKENS_FREE,
     MAX_TOKENS_MCQ,
     MAX_TOKENS_MCQ_FINAL,
+    MCQ_VERIFY_ENABLED,
+    MCQ_VERIFY_MAX_FRACTION,
+    MCQ_VERIFY_TRIGGER_MIN_SCORE,
     MIN_TOKENS_BEFORE_BOXED_STOP,
     MODEL_ID,
     NO_REPEAT_NGRAM_SIZE_FREE,
@@ -121,15 +125,17 @@ def _extract_last_valid_letter(text: str, labels: list[str]) -> str:
     return candidates[-1] if candidates else ""
 
 
-def _should_force_mcq_finalizer(raw_text: str, labels: list[str]) -> bool:
-    """Return True when primary MCQ extraction should defer to finalizer."""
+def _mcq_finalizer_signal(raw_text: str, labels: list[str]) -> tuple[int, list[str]]:
+    """Return (risk_score, reasons) for whether MCQ should use finalizer."""
     spans = iter_boxed_spans(raw_text)
     if not spans:
-        return True
+        return 4, ["no_boxed_span"]
 
     valid = {str(label).strip().upper() for label in labels}
     valid_letter_spans = 0
     nonletter_boxed = 0
+    reasons: list[str] = []
+    score = 0
 
     for _start, _end, inner in spans:
         if _mcq_letter_from_boxed_inner(inner, valid):
@@ -137,18 +143,22 @@ def _should_force_mcq_finalizer(raw_text: str, labels: list[str]) -> bool:
         elif str(inner or "").strip():
             nonletter_boxed += 1
 
-    # Multiple boxed segments or boxed non-letters usually indicate noisy raw
-    # output where direct "last valid letter" can be brittle.
+    # Multiple boxed segments or boxed non-letters indicate noisy raw output
+    # where direct "last valid letter" is often brittle.
     if len(spans) != 1:
-        return True
+        score += 1
+        reasons.append("multi_boxed")
     if nonletter_boxed > 0:
-        return True
+        score += 2
+        reasons.append("nonletter_boxed")
     if valid_letter_spans != 1:
-        return True
+        score += 2
+        reasons.append("ambiguous_letter_spans")
 
     if _MCQ_UNCERTAINTY_RE.search(raw_text):
-        return True
-    return False
+        score += 1
+        reasons.append("uncertainty_phrase")
+    return score, reasons
 
 
 def _apply_vllm_quantization_kwargs(
@@ -492,6 +502,7 @@ class ModularPipeline:
             valid_upper = {str(x).strip().upper() for x in mcq_valid}
 
             valid_spans: list[tuple[int, int, bool]] = []
+            valid_spans: list[tuple[int, int, bool]] = []
             for start, end, inner in spans:
                 cand = _mcq_letter_from_boxed_inner(inner, valid_upper)
                 if not cand:
@@ -507,8 +518,18 @@ class ModularPipeline:
                 context = raw_clean[context_start:start]
                 cue_hit = bool(_FINAL_CUE_RE.search(context))
                 valid_spans.append((start, end, cue_hit))
+                cue_window = max(0, int(FINAL_ANSWER_CUE_WINDOW_CHARS))
+                context_start = max(0, start - cue_window)
+                context = raw_clean[context_start:start]
+                cue_hit = bool(_FINAL_CUE_RE.search(context))
+                valid_spans.append((start, end, cue_hit))
 
             if valid_spans:
+                # Prefer a cue-aligned final answer box; otherwise keep the last
+                # valid boxed letter so mid-reasoning tentative choices do not win.
+                cue_spans = [span for span in valid_spans if span[2]]
+                chosen = cue_spans[-1] if cue_spans else valid_spans[-1]
+                _start, end, _cue_hit = chosen
                 # Prefer a cue-aligned final answer box; otherwise keep the last
                 # valid boxed letter so mid-reasoning tentative choices do not win.
                 cue_spans = [span for span in valid_spans if span[2]]
@@ -704,6 +725,9 @@ class ModularPipeline:
         confidence_tier: str = "",
         guessed_letter_used: bool = False,
         finalizer_extractor_path: str = "",
+        verify_triggered: bool = False,
+        verify_reason: str = "",
+        verify_score: int = 0,
     ) -> dict:
         raw_recovery_path = ""
         for candidate_path in (extractor_path, finalizer_extractor_path):
@@ -739,6 +763,9 @@ class ModularPipeline:
             "finalizer_extractor_path": finalizer_extractor_path,
             "raw_letter_recovered": bool(raw_recovery_path),
             "raw_letter_recovery_path": raw_recovery_path,
+            "verify_triggered": bool(verify_triggered),
+            "verify_reason": str(verify_reason or ""),
+            "verify_score": int(verify_score),
             "stop_policy": "smart_boxed_post",
         }
 
@@ -882,6 +909,14 @@ class ModularPipeline:
         primary_raws: list[str] = []
 
         primary_pre_truncs: list[str] = []
+        verify_scores: list[int] = [0] * len(items)
+        verify_reasons: list[str] = [""] * len(items)
+        verify_budget = (
+            max(0, int(math.ceil(len(items) * float(MCQ_VERIFY_MAX_FRACTION))))
+            if MCQ_VERIFY_ENABLED
+            else 0
+        )
+        verify_used = 0
 
         for idx, (item, out) in enumerate(zip(items, primary_outputs)):
             raw = out["raw"]
@@ -925,7 +960,17 @@ class ModularPipeline:
             primary_pre_truncs.append(raw_pre)
 
             if letter:
-                force_finalizer = _should_force_mcq_finalizer(raw, labels)
+                score, reasons = _mcq_finalizer_signal(raw, labels)
+                verify_scores[idx] = int(score)
+                verify_reasons[idx] = ",".join(reasons) if reasons else ""
+                force_finalizer = False
+                if (
+                    MCQ_VERIFY_ENABLED
+                    and score >= int(MCQ_VERIFY_TRIGGER_MIN_SCORE)
+                    and verify_used < verify_budget
+                ):
+                    force_finalizer = True
+                    verify_used += 1
                 if not force_finalizer:
                     response = mcq_canonical_response(letter)
                     phrase_only = extractor_path_primary in (
@@ -958,19 +1003,25 @@ class ModularPipeline:
                             ),
                             guessed_letter_used=phrase_only,
                             finalizer_extractor_path="",
+                            verify_triggered=False,
+                            verify_reason="",
+                            verify_score=verify_scores[idx],
                         ),
                     }
                 else:
                     finalizer_items.append(item)
                     finalizer_indices.append(idx)
             else:
+                verify_scores[idx] = 5
+                verify_reasons[idx] = "no_primary_letter"
                 finalizer_items.append(item)
                 finalizer_indices.append(idx)
 
         if finalizer_items:
             print(
                 f"[debug] solve_mcq_batch: finalizer_items={len(finalizer_items)} "
-                f"mcq_final_max_new_tokens={self.mcq_final_max_new_tokens}",
+                f"mcq_final_max_new_tokens={self.mcq_final_max_new_tokens} "
+                f"verify_enabled={MCQ_VERIFY_ENABLED} verify_used={verify_used}/{verify_budget}",
                 flush=True,
             )
             finalizer_system_prompts = [_SYSTEM_PROMPT_MCQ_FINALIZER] * len(finalizer_items)
@@ -994,6 +1045,8 @@ class ModularPipeline:
                     "Raw model output to extract from:\n"
                     f"{raw_for_finalizer}\n\n"
                     "Return exactly one boxed letter: \\boxed{X}, where X is one valid choice. "
+                    "If raw includes a boxed non-letter value (e.g. \\boxed{601}), map that value "
+                    "to the matching option text and return that option letter. "
                     "If raw includes a boxed non-letter value (e.g. \\boxed{601}), map that value "
                     "to the matching option text and return that option letter. "
                     "If multiple letters appear, use the final supported choice in the raw text. "
@@ -1072,6 +1125,9 @@ class ModularPipeline:
                         confidence_tier=confidence_tier,
                         guessed_letter_used=guessed_letter_used,
                         finalizer_extractor_path=path,
+                        verify_triggered=True,
+                        verify_reason=verify_reasons[original_idx],
+                        verify_score=verify_scores[original_idx],
                     ),
                 }
 

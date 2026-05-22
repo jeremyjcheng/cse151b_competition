@@ -90,6 +90,12 @@ THINK_BUDGET_MCQ = 0
 # Finalizer only emits one box; a bit of headroom avoids cut-off \\boxed{}.
 MAX_TOKENS_MCQ_FINAL = 512
 
+# Adaptive MCQ verify/finalizer routing.
+# Runs only on low-confidence rows and caps verify volume per batch.
+MCQ_VERIFY_ENABLED = True
+MCQ_VERIFY_MAX_FRACTION = 0.25
+MCQ_VERIFY_TRIGGER_MIN_SCORE = 2
+
 # Greedy MCQ decoding.
 TEMP_MCQ = 0.0
 TOP_P_MCQ = 1.0

@@ -192,13 +192,23 @@ def parse_train_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--stage",
-        choices=("reasoning", "adapt", "mcq", "mixed_reasoning_mcq"),
+        choices=("reasoning", "adapt", "mcq", "mixed_reasoning_mcq", "rejection_sft"),
         default="adapt",
         help=(
             "Training stage. `reasoning` trains on public reasoning datasets; "
             "`adapt` lightly adapts formatting on competition data; "
             "`mcq` trains MCQ-focused adapter data; "
-            "`mixed_reasoning_mcq` mixes FRQ reasoning + MCQ data."
+            "`mixed_reasoning_mcq` mixes FRQ reasoning + MCQ data; "
+            "`rejection_sft` trains only on accepted rejection replay traces."
+        ),
+    )
+    parser.add_argument(
+        "--train-preset",
+        choices=("none", "fast_pilot", "one_day_full"),
+        default="none",
+        help=(
+            "Optional training preset for compute-constrained CoT runs. "
+            "`fast_pilot` targets a short smoke run; `one_day_full` targets ~1 day on 1 GPU."
         ),
     )
     parser.add_argument(
@@ -372,6 +382,33 @@ def parse_train_args() -> argparse.Namespace:
         help="Optional cap for Hendrycks examples in stage `reasoning`.",
     )
     parser.add_argument(
+        "--include-orca-math",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Include microsoft/orca-math-word-problems-200k in reasoning-capable stages.",
+    )
+    parser.add_argument(
+        "--max-orca-math-examples",
+        type=int,
+        default=None,
+        help="Optional cap for Orca-Math examples.",
+    )
+    parser.add_argument(
+        "--include-ultrainteract-math",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Include openbmb/UltraInteract_sft filtered to task in {Math_Cot, Math_PoT} "
+            "and tool-safe rows."
+        ),
+    )
+    parser.add_argument(
+        "--max-ultrainteract-math-examples",
+        type=int,
+        default=None,
+        help="Optional cap for UltraInteract math-only examples.",
+    )
+    parser.add_argument(
         "--include-math-mc",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -405,6 +442,60 @@ def parse_train_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--metamathqa-weight",
+        type=float,
+        default=1.0,
+        help="Relative weight for MetaMathQA examples in mixed training.",
+    )
+    parser.add_argument(
+        "--numinamath-cot-weight",
+        type=float,
+        default=1.0,
+        help="Relative weight for NuminaMath-CoT examples in mixed training.",
+    )
+    parser.add_argument(
+        "--openmath-weight",
+        type=float,
+        default=1.0,
+        help="Relative weight for OpenMathReasoning examples in mixed training.",
+    )
+    parser.add_argument(
+        "--hendrycks-weight",
+        type=float,
+        default=1.0,
+        help="Relative weight for Hendrycks examples in mixed training.",
+    )
+    parser.add_argument(
+        "--orca-math-weight",
+        type=float,
+        default=1.0,
+        help="Relative weight for Orca-Math examples in mixed training.",
+    )
+    parser.add_argument(
+        "--ultrainteract-math-weight",
+        type=float,
+        default=1.0,
+        help="Relative weight for UltraInteract Math_Cot/Math_PoT examples in mixed training.",
+    )
+    parser.add_argument(
+        "--math-mc-weight",
+        type=float,
+        default=1.0,
+        help="Relative weight for math-mc examples in mixed training.",
+    )
+    parser.add_argument(
+        "--compmath-mcq-weight",
+        type=float,
+        default=1.0,
+        help="Relative weight for CompMath-MCQ examples in mixed training.",
+    )
+    parser.add_argument(
+        "--base-replay-weight",
+        type=float,
+        default=1.0,
+        help="Relative weight for base replay examples in mixed training.",
+    )
+    parser.add_argument(
         "--mcq-target-mode",
         choices=("letter_only", "full_trace"),
         default="letter_only",
@@ -412,6 +503,15 @@ def parse_train_args() -> argparse.Namespace:
             "MCQ supervision shape. `letter_only` trains on \\boxed{letter} only (fast, no CoT). "
             "`full_trace` trains on reasoning text ending in \\boxed{letter}: base-replay uses "
             "JSONL `raw` traces; hub MCQ sets use a short rationale stub (no real CoT in those datasets)."
+        ),
+    )
+    parser.add_argument(
+        "--mcq-bridge-short",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable short MCQ bridge defaults: prioritize MCQ + accepted replay with "
+            "conservative step budget for one-day runs."
         ),
     )
     parser.add_argument(
@@ -567,6 +667,65 @@ def parse_train_args() -> argparse.Namespace:
             "gate_proj", "up_proj", "down_proj",
         ]
 
+    return _apply_train_preset(args)
+
+
+def _apply_train_preset(args: argparse.Namespace) -> argparse.Namespace:
+    if getattr(args, "train_preset", "none") == "none":
+        return args
+
+    if args.train_preset == "fast_pilot":
+        args.include_metamathqa = True
+        args.include_numinamath_cot = True
+        args.include_openmath = True
+        args.include_hendrycks = False
+        args.include_orca_math = True
+        args.include_ultrainteract_math = False
+        args.max_metamathqa_examples = 2000
+        args.max_numinamath_cot_examples = 2000
+        args.max_openmath_examples = 1500
+        args.max_orca_math_examples = 3000
+        args.metamathqa_weight = 1.0
+        args.numinamath_cot_weight = 1.0
+        args.openmath_weight = 1.0
+        args.orca_math_weight = 0.8
+        if args.stage in {"mcq", "mixed_reasoning_mcq"}:
+            args.mcq_bridge_short = True
+        if args.stage in {"mcq", "mixed_reasoning_mcq", "rejection_sft"}:
+            args.max_steps = min(int(args.max_steps), 120)
+        else:
+            args.max_steps = min(int(args.max_steps), 180)
+        print("Applied train preset: fast_pilot")
+        return args
+
+    # one_day_full
+    args.include_metamathqa = True
+    args.include_numinamath_cot = True
+    args.include_openmath = True
+    args.include_hendrycks = True
+    args.include_orca_math = True
+    args.include_ultrainteract_math = True
+    args.max_metamathqa_examples = 8000
+    args.max_numinamath_cot_examples = 8000
+    args.max_openmath_examples = 6000
+    args.max_hendrycks_examples = 5000
+    args.max_orca_math_examples = 30000
+    args.max_ultrainteract_math_examples = 12000
+    args.metamathqa_weight = 1.2
+    args.numinamath_cot_weight = 1.2
+    args.openmath_weight = 1.1
+    args.hendrycks_weight = 1.0
+    args.orca_math_weight = 1.0
+    args.ultrainteract_math_weight = 0.7
+    args.base_replay_weight = 1.1
+    args.rejection_replay_weight = 1.3
+    if args.stage in {"mcq", "mixed_reasoning_mcq"}:
+        args.mcq_bridge_short = True
+    if args.stage in {"mcq", "mixed_reasoning_mcq", "rejection_sft"}:
+        args.max_steps = min(int(args.max_steps), 220)
+    else:
+        args.max_steps = min(int(args.max_steps), 400)
+    print("Applied train preset: one_day_full")
     return args
 
 
