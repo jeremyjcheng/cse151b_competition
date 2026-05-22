@@ -194,6 +194,48 @@ def extract_valid_letter(text: str, labels: list[str]) -> str:
     return ""
 
 
+def extract_mcq_letter_from_option_phrases(text: str, labels: list[str]) -> str:
+    """Extract a valid MCQ letter from explicit option/answer phrase patterns.
+
+    Targets recovery cases where output was truncated but still includes clues
+    like:
+      - "option B is ..."
+      - "option C matches ..."
+      - "the answer is D"
+      - "choice A"
+      - "A is correct"
+    """
+    valid_set_upper = {str(x).strip().upper() for x in labels}
+    if not text or not valid_set_upper:
+        return ""
+
+    upper = text.upper()
+    patterns = [
+        r"\bOPTION\s+([A-Z])\s+IS\b",
+        r"\bOPTION\s+([A-Z])\s+MATCH(?:ES|ED|ING)?\b",
+        r"\bOPTION\s*[:=-]?\s*([A-Z])\b",
+        r"\bTHE\s+ANSWER\s+IS\s+([A-Z])\b",
+        r"\bANSWER\s+IS\s+([A-Z])\b",
+        r"\bFINAL\s+ANSWER\s*(?:IS|=|:)\s*([A-Z])\b",
+        r"\bCHOICE\s+([A-Z])\b",
+        r"\bCHOOSE\s+([A-Z])\b",
+        r"\bPICK\s+([A-Z])\b",
+        r"\b([A-Z])\s+IS\s+CORRECT\b",
+        r"\b([A-Z])\s+IS\s+THE\s+CORRECT\s+(?:ANSWER|CHOICE|OPTION)\b",
+    ]
+
+    best_pos = -1
+    best_letter = ""
+    for pattern in patterns:
+        for m in re.finditer(pattern, upper):
+            cand = m.group(1).strip().upper()
+            if cand in valid_set_upper and m.start() >= best_pos:
+                best_pos = m.start()
+                best_letter = cand
+
+    return best_letter
+
+
 def extract_first_valid_letter(text: str, labels: list[str]) -> str:
     """Extract the first valid MCQ letter, prioritizing boxed options."""
     valid_set_upper = {str(x).strip().upper() for x in labels}

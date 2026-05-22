@@ -61,10 +61,12 @@ from settings import (
     VLLM_QUANTIZATION,
 )
 from text_processing import (
+    _mcq_letter_from_boxed_inner,
     canonicalize_free_response_with_meta,
     clean_special_tokens,
     extract_boxed,
     extract_all_boxed,
+    extract_mcq_letter_from_option_phrases,
     extract_tail_mcq_letter,
     extract_valid_letter,
     iter_boxed_spans,
@@ -73,6 +75,12 @@ from text_processing import (
 )
 
 _FINAL_CUE_RE = re.compile(r"(?:final\s+answer|therefore|thus|hence)\b", re.IGNORECASE)
+_SYSTEM_PROMPT_MCQ_FINALIZER = (
+    "You are an MCQ extraction assistant. Do not solve the problem again. "
+    "Read the provided raw model output and extract only the selected option letter. "
+    "Return exactly one boxed option letter like \\boxed{A}. "
+    "Do not output anything after the boxed letter."
+)
 
 _TRAINING_ECHO_PATTERNS = (
     "Solve this problem concisely",
@@ -100,7 +108,7 @@ def _extract_last_valid_letter(text: str, labels: list[str]) -> str:
     candidates: list[str] = []
 
     for _start, _end, inner in iter_boxed_spans(text):
-        cand = inner.strip().upper()
+        cand = _mcq_letter_from_boxed_inner(inner, valid)
         if cand in valid:
             candidates.append(cand)
 
@@ -391,6 +399,7 @@ class ModularPipeline:
         repetition_penalty: float,
         do_sample: bool,
         no_repeat_ngram_size: int = 0,
+        seed: int | None = None,
     ):
         """Map HF-style do_sample to vLLM SamplingParams.
 
@@ -416,6 +425,8 @@ class ModularPipeline:
             presence_penalty=0.0,
             repetition_penalty=repetition_penalty,
         )
+        if seed is not None:
+            sampling_kwargs["seed"] = int(seed)
 
         if no_repeat_ngram_size and no_repeat_ngram_size > 0:
             sampling_kwargs["no_repeat_ngram_size"] = no_repeat_ngram_size
@@ -446,7 +457,8 @@ class ModularPipeline:
 
             valid_spans = []
             for start, end, inner in spans:
-                if inner.strip().upper() not in valid_upper:
+                cand = _mcq_letter_from_boxed_inner(inner, valid_upper)
+                if not cand:
                     continue
 
                 prefix = raw_clean[:end]
@@ -454,11 +466,19 @@ class ModularPipeline:
                 if prefix_tokens < MIN_TOKENS_BEFORE_BOXED_STOP:
                     continue
 
-                valid_spans.append((start, end, inner))
+                valid_spans.append((start, end))
 
             if valid_spans:
-                _start, end, _inner = valid_spans[-1]
-                _ = post_box_patience_tokens
+                # Pick earliest valid final-answer box after the minimum token threshold.
+                # This avoids long post-answer loops on MCQ outputs.
+                _start, end = valid_spans[0]
+                if post_box_patience_tokens > 0:
+                    suffix = raw_clean[end:]
+                    suffix_tokens = self.tokenizer.encode(suffix, add_special_tokens=False)
+                    keep_tokens = suffix_tokens[: post_box_patience_tokens]
+                    if keep_tokens:
+                        suffix_keep = self.tokenizer.decode(keep_tokens, skip_special_tokens=True)
+                        return (raw_clean[:end] + suffix_keep).rstrip()
                 return raw_clean[:end].rstrip()
 
             # Do not truncate MCQ output to a random non-letter box.
@@ -484,6 +504,7 @@ class ModularPipeline:
         mcq_valid_per_row: list[set[str]] | None = None,
         post_box_patience_tokens: int = POST_BOX_PATIENCE_TOKENS_FREE,
         no_repeat_ngram_size: int = 0,
+        sampling_seed: int | None = None,
     ) -> list[dict]:
         # vLLM cannot enforce your old token-level think_budget logic.
         del think_budget
@@ -501,6 +522,7 @@ class ModularPipeline:
             repetition_penalty=repetition_penalty,
             do_sample=do_sample,
             no_repeat_ngram_size=no_repeat_ngram_size,
+            seed=sampling_seed,
         )
 
         llm_kwargs: dict[str, Any] = dict(
@@ -636,10 +658,17 @@ class ModularPipeline:
         training_echo_detected: bool = False,
         pre_trunc_n_tokens: int | None = None,
         generation_hit_max: bool | None = None,
+        raw_was_post_truncated: bool = False,
         confidence_tier: str = "",
         guessed_letter_used: bool = False,
         finalizer_extractor_path: str = "",
     ) -> dict:
+        raw_recovery_path = ""
+        for candidate_path in (extractor_path, finalizer_extractor_path):
+            if "raw_option_phrase" in candidate_path:
+                raw_recovery_path = candidate_path
+                break
+
         return {
             "is_mcq": True,
             "output_type": "mcq",
@@ -651,6 +680,7 @@ class ModularPipeline:
             "total_n_tokens": n_tokens + finalizer_n_tokens,
             "pre_trunc_n_tokens": pre_trunc_n_tokens,
             "generation_hit_max": generation_hit_max,
+            "raw_was_post_truncated": raw_was_post_truncated,
             "boxed": extract_boxed(response),
             "cleaned_response": response,
             "raw_was_truncated": response != primary_raw,
@@ -665,6 +695,8 @@ class ModularPipeline:
             "confidence_tier": confidence_tier,
             "guessed_letter_used": guessed_letter_used,
             "finalizer_extractor_path": finalizer_extractor_path,
+            "raw_letter_recovered": bool(raw_recovery_path),
+            "raw_letter_recovery_path": raw_recovery_path,
             "stop_policy": "smart_boxed_post",
         }
 
@@ -687,6 +719,10 @@ class ModularPipeline:
         if letter:
             return letter, False, "mcq_finalizer_tail_phrase", "answer_phrase_medium"
 
+        letter = extract_mcq_letter_from_option_phrases(finalizer_raw, labels)
+        if letter:
+            return letter, False, "mcq_finalizer_raw_option_phrase", "answer_phrase_medium"
+
         for blob in (visible_answer_after_think_tags(finalizer_raw), finalizer_raw):
             letter = extract_valid_letter(blob, labels) if blob else ""
             if letter:
@@ -701,6 +737,10 @@ class ModularPipeline:
             if letter:
                 return letter, False, "mcq_primary_tail_phrase", "answer_phrase_medium"
 
+            letter = extract_mcq_letter_from_option_phrases(primary_raw, labels)
+            if letter:
+                return letter, False, "mcq_raw_option_phrase", "answer_phrase_medium"
+
             for blob in (visible_answer_after_think_tags(primary_raw), primary_raw):
                 letter = extract_valid_letter(blob, labels) if blob else ""
                 if letter:
@@ -711,6 +751,10 @@ class ModularPipeline:
                 if letter:
                     return letter, False, "mcq_pre_trunc_last_valid_letter", "boxed_high"
 
+                letter = extract_mcq_letter_from_option_phrases(primary_raw_before_trunc, labels)
+                if letter:
+                    return letter, False, "mcq_pre_trunc_raw_option_phrase", "answer_phrase_medium"
+
                 for blob in (
                     visible_answer_after_think_tags(primary_raw_before_trunc),
                     primary_raw_before_trunc,
@@ -720,6 +764,10 @@ class ModularPipeline:
                         return letter, False, "mcq_pre_trunc_phrase_fulltext", "answer_phrase_medium"
 
             combo = f"{primary_raw}\n\n{finalizer_raw}"
+            letter = extract_mcq_letter_from_option_phrases(combo, labels)
+            if letter:
+                return letter, False, "mcq_combined_raw_option_phrase", "answer_phrase_medium"
+
             for blob in (visible_answer_after_think_tags(combo), combo):
                 letter = extract_valid_letter(blob, labels) if blob else ""
                 if letter:
@@ -742,7 +790,16 @@ class ModularPipeline:
 
         return "", False, "mcq_abstain_no_signal", "none"
 
-    def solve_mcq_batch(self, items: list[dict]) -> list[dict]:
+    def solve_mcq_batch(
+        self,
+        items: list[dict],
+        *,
+        do_sample: bool = False,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        top_k: int | None = None,
+        sampling_seed: int | None = None,
+    ) -> list[dict]:
         if not items:
             return []
         print(
@@ -763,17 +820,18 @@ class ModularPipeline:
             system_prompts,
             user_prompts,
             max_new_tokens=self.mcq_max_new_tokens,
-            temperature=TEMP_MCQ,
-            top_p=TOP_P_MCQ,
-            top_k=TOP_K_MCQ,
+            temperature=TEMP_MCQ if temperature is None else float(temperature),
+            top_p=TOP_P_MCQ if top_p is None else float(top_p),
+            top_k=TOP_K_MCQ if top_k is None else int(top_k),
             repetition_penalty=REP_PEN_MCQ,
-            do_sample=False,
+            do_sample=bool(do_sample),
             think_budget=0,
             enable_thinking=ENABLE_THINKING_MCQ_PRIMARY,
             force_smart_boxed_stop=True,
             mcq_valid_per_row=mcq_valid,
             post_box_patience_tokens=POST_BOX_PATIENCE_TOKENS_MCQ,
             no_repeat_ngram_size=NO_REPEAT_NGRAM_SIZE_MCQ,
+            sampling_seed=sampling_seed,
         )
 
         solved: list[dict | None] = [None] * len(items)
@@ -796,6 +854,10 @@ class ModularPipeline:
                 for blob in (visible_answer_after_think_tags(raw), raw):
                     if not blob:
                         continue
+                    letter = extract_mcq_letter_from_option_phrases(blob, labels)
+                    if letter:
+                        extractor_path_primary = "mcq_raw_option_phrase"
+                        break
                     letter = extract_valid_letter(blob, labels)
                     if letter:
                         extractor_path_primary = "mcq_primary_phrase_fulltext"
@@ -808,6 +870,10 @@ class ModularPipeline:
                 for blob in (visible_answer_after_think_tags(raw_pre), raw_pre):
                     if not blob:
                         continue
+                    letter = extract_mcq_letter_from_option_phrases(blob, labels)
+                    if letter:
+                        extractor_path_primary = "mcq_primary_pre_trunc_raw_option_phrase"
+                        break
                     letter = extract_valid_letter(blob, labels)
                     if letter:
                         extractor_path_primary = "mcq_primary_pre_trunc_phrase"
@@ -839,6 +905,7 @@ class ModularPipeline:
                         training_echo_detected=echo,
                         pre_trunc_n_tokens=out.get("pre_trunc_n_tokens"),
                         generation_hit_max=out.get("generation_hit_max"),
+                        raw_was_post_truncated=bool(out.get("raw_was_post_truncated", False)),
                         confidence_tier=(
                             "boxed_high"
                             if extractor_path_primary
@@ -859,25 +926,29 @@ class ModularPipeline:
                 f"mcq_final_max_new_tokens={self.mcq_final_max_new_tokens}",
                 flush=True,
             )
-            finalizer_system_prompts = [SYSTEM_PROMPT_MCQ] * len(finalizer_items)
+            finalizer_system_prompts = [_SYSTEM_PROMPT_MCQ_FINALIZER] * len(finalizer_items)
 
             finalizer_user_prompts: list[str] = []
 
-            for item, _original_idx in zip(finalizer_items, finalizer_indices):
+            for item, original_idx in zip(finalizer_items, finalizer_indices):
                 labels = [chr(65 + i) for i in range(len(item["options"]))]
                 valid_letters = ", ".join(labels)
                 opts_text = "\n".join(
                     f"{lbl}. {str(opt).strip()}"
                     for lbl, opt in zip(labels, item["options"])
                 )
+                raw_for_finalizer = primary_pre_truncs[original_idx]
 
                 finalizer_user_prompts.append(
+                    "Do not solve this question. Only extract a letter from the raw output.\n\n"
                     f"Question:\n{item['question']}\n\n"
                     f"Options:\n{opts_text}\n\n"
-                    f"Valid choices: [{valid_letters}].\n"
-                    "Return exactly one boxed letter in this format: \\boxed{X}, "
-                    "where X is one of the valid choices. "
-                    "Do not include explanation or extra text."
+                    f"Valid choices: [{valid_letters}].\n\n"
+                    "Raw model output to extract from:\n"
+                    f"{raw_for_finalizer}\n\n"
+                    "Return exactly one boxed letter: \\boxed{X}, where X is one valid choice. "
+                    "If multiple letters appear, use the final supported choice in the raw text. "
+                    "Do not output explanation or any extra text."
                 )
 
             fin_valid = [
@@ -946,6 +1017,9 @@ class ModularPipeline:
                         training_echo_detected=echo,
                         pre_trunc_n_tokens=primary_outputs[original_idx].get("pre_trunc_n_tokens"),
                         generation_hit_max=primary_outputs[original_idx].get("generation_hit_max"),
+                        raw_was_post_truncated=bool(
+                            primary_outputs[original_idx].get("raw_was_post_truncated", False)
+                        ),
                         confidence_tier=confidence_tier,
                         guessed_letter_used=guessed_letter_used,
                         finalizer_extractor_path=path,
@@ -954,7 +1028,16 @@ class ModularPipeline:
 
         return [x for x in solved if x is not None]
 
-    def solve_free_batch(self, items: list[dict]) -> list[dict]:
+    def solve_free_batch(
+        self,
+        items: list[dict],
+        *,
+        do_sample: bool = True,
+        temperature: float | None = None,
+        top_p: float | None = None,
+        top_k: int | None = None,
+        sampling_seed: int | None = None,
+    ) -> list[dict]:
         if not items:
             return []
         print(
@@ -970,16 +1053,17 @@ class ModularPipeline:
             system_prompts,
             user_prompts,
             max_new_tokens=self.free_max_new_tokens,
-            temperature=TEMP_FREE,
-            top_p=TOP_P_FREE,
-            top_k=TOP_K_FREE,
+            temperature=TEMP_FREE if temperature is None else float(temperature),
+            top_p=TOP_P_FREE if top_p is None else float(top_p),
+            top_k=TOP_K_FREE if top_k is None else int(top_k),
             repetition_penalty=REP_PEN_FREE,
-            do_sample=True,
+            do_sample=bool(do_sample),
             think_budget=0,
             force_smart_boxed_stop=True,
             mcq_valid_per_row=None,
             post_box_patience_tokens=POST_BOX_PATIENCE_TOKENS_FREE,
             no_repeat_ngram_size=NO_REPEAT_NGRAM_SIZE_FREE,
+            sampling_seed=sampling_seed,
         )
 
         solved: list[dict] = []

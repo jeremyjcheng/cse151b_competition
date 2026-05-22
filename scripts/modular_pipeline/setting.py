@@ -95,8 +95,8 @@ TEMP_MCQ = 0.0
 TOP_P_MCQ = 1.0
 TOP_K_MCQ = 0
 
-# Keep repetition penalties neutral for MCQ. Higher values were likely hurting output.
-REP_PEN_MCQ = 1.0
+# Mild repetition penalty helps reduce MCQ loop failures without heavily biasing decoding.
+REP_PEN_MCQ = 1.05
 REP_PEN_MCQ_FINAL = 1.0
 
 

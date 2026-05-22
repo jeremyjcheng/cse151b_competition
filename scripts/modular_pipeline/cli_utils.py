@@ -445,6 +445,32 @@ def parse_train_args() -> argparse.Namespace:
         help="Optional cap for accepted base replay examples.",
     )
     parser.add_argument(
+        "--include-rejection-replay",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Include high-quality rejection-sampled replay examples from JSONL.",
+    )
+    parser.add_argument(
+        "--rejection-replay-path",
+        default=None,
+        help="Path to rejection replay JSONL built from judged correct traces.",
+    )
+    parser.add_argument(
+        "--max-rejection-replay-examples",
+        type=int,
+        default=None,
+        help="Optional cap for accepted rejection replay examples.",
+    )
+    parser.add_argument(
+        "--rejection-replay-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "Relative weight for rejection replay examples. "
+            "1.0 keeps natural counts; >1 upsamples; <1 downsamples."
+        ),
+    )
+    parser.add_argument(
         "--hendrycks-configs",
         nargs="+",
         default=[

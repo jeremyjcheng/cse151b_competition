@@ -199,6 +199,32 @@ def _is_valid_mcq_full_trace_target(target: str, letter: str) -> bool:
     return boxed[-1].strip().upper() == letter.upper()
 
 
+TARGET_KIND_REAL_REASONING = "real_reasoning"
+TARGET_KIND_STUB_RATIONALE = "stub_rationale"
+TARGET_KIND_LETTER_ONLY = "letter_only"
+TARGET_KIND_REPLAY_RAW_TRACE = "replay_raw_trace"
+TARGET_KIND_FINAL_ANSWER_ONLY = "final_answer_only"
+
+
+def _describe_target_kind(kind: str) -> str:
+    descriptions = {
+        TARGET_KIND_REAL_REASONING: "dataset reasoning field (real CoT)",
+        TARGET_KIND_STUB_RATIONALE: "synthetic MCQ rationale stub (not real CoT)",
+        TARGET_KIND_LETTER_ONLY: "boxed letter only",
+        TARGET_KIND_REPLAY_RAW_TRACE: "base replay JSONL raw trace (real CoT)",
+        TARGET_KIND_FINAL_ANSWER_ONLY: "final boxed answer only",
+    }
+    return descriptions.get(kind, "unknown")
+
+
+def _mcq_target_kind(mcq_target_mode: str, *, replay_raw: bool = False) -> str:
+    if replay_raw:
+        return TARGET_KIND_REPLAY_RAW_TRACE
+    if mcq_target_mode == "full_trace":
+        return TARGET_KIND_STUB_RATIONALE
+    return TARGET_KIND_LETTER_ONLY
+
+
 def _build_mcq_training_target(
     letter: str,
     *,
@@ -356,6 +382,7 @@ def _load_metamathqa_examples(max_examples: int | None, seed: int) -> tuple[list
                     "Provide concise step-by-step reasoning and finish with exactly one final \\boxed{...}."
                 ),
                 "source": "metamathqa",
+                "target_kind": TARGET_KIND_REAL_REASONING,
             }
         )
     return examples, _finalize_stats(stats, len(examples))
@@ -400,6 +427,7 @@ def _load_numinamath_cot_examples(
                     "Provide concise step-by-step reasoning and finish with exactly one final \\boxed{...}."
                 ),
                 "source": "numinamath_cot",
+                "target_kind": TARGET_KIND_REAL_REASONING,
             }
         )
     return examples, _finalize_stats(stats, len(examples))
@@ -438,6 +466,7 @@ def _load_openmath_examples(max_examples: int | None, seed: int) -> tuple[list[d
                     "Provide concise step-by-step reasoning and finish with exactly one final \\boxed{...}."
                 ),
                 "source": "openmath",
+                "target_kind": TARGET_KIND_REAL_REASONING,
             }
         )
     return examples, _finalize_stats(stats, len(examples))
@@ -488,6 +517,7 @@ def _load_hendrycks_examples(
                     "Provide concise step-by-step reasoning and finish with exactly one final \\boxed{...}."
                 ),
                 "source": "hendrycks",
+                "target_kind": TARGET_KIND_REAL_REASONING,
             }
         )
     return examples, _finalize_stats(stats, len(examples))
@@ -641,6 +671,7 @@ def _load_math_mc_examples(
                     "Reason step by step and end with exactly one final boxed option letter."
                 ),
                 "source": "math_mc",
+                "target_kind": _mcq_target_kind(mcq_target_mode),
             }
         )
 
@@ -744,6 +775,7 @@ def _load_compmath_mcq_examples(
                     "Reason step by step and end with exactly one final boxed option letter."
                 ),
                 "source": "compmath_mcq",
+                "target_kind": _mcq_target_kind(mcq_target_mode),
             }
         )
 
@@ -894,6 +926,10 @@ def _load_base_replay_examples(
                     continue
             prompt = _build_strict_mcq_prompt(question, options)
             example_type = "mcq"
+            target_kind = _mcq_target_kind(
+                mcq_target_mode,
+                replay_raw=mcq_target_mode == "full_trace",
+            )
         else:
             boxed = extract_boxed(response).strip()
             if not boxed:
@@ -902,6 +938,7 @@ def _load_base_replay_examples(
             target = _enforce_single_final_boxed("", fallback_answer=boxed)
             prompt = build_adapt_train_free_user(question)
             example_type = "frq"
+            target_kind = TARGET_KIND_FINAL_ANSWER_ONLY
 
         examples.append(
             {
@@ -913,6 +950,91 @@ def _load_base_replay_examples(
                     "Preserve stable behavior and finish with exactly one final \\boxed{...}."
                 ),
                 "source": "base_replay",
+                "target_kind": target_kind,
+            }
+        )
+
+    return examples, _finalize_stats(stats, len(examples))
+
+
+def _load_rejection_replay_examples(
+    *,
+    replay_path: Path,
+    max_examples: int | None,
+    seed: int,
+) -> tuple[list[dict], dict]:
+    if not replay_path.exists():
+        raise SystemExit(f"--rejection-replay-path not found: {replay_path}")
+
+    stats = _new_dataset_stats("rejection_replay")
+    rows = _load_jsonl(replay_path)
+    stats["loaded"] = len(rows)
+    stats["schema"] = {
+        "path": str(replay_path),
+        "row_count": len(rows),
+        "first_row_keys": sorted(list(rows[0].keys())) if rows else [],
+    }
+    if not rows:
+        return [], _finalize_stats(stats, 0)
+
+    required = {"question", "accepted_raw", "is_mcq", "filter_passed"}
+    missing = sorted(list(required - set(rows[0].keys())))
+    if missing:
+        raise SystemExit(
+            "Rejection replay schema incompatible: "
+            f"missing keys={missing}, first_row_keys={stats['schema']['first_row_keys']}"
+        )
+
+    rows = _sample_cap(rows, max_examples, seed)
+    examples: list[dict] = []
+    for row in rows:
+        if not bool(row.get("filter_passed", False)):
+            _skip(stats, "filter_not_passed")
+            continue
+
+        question = str(row.get("question") or "").strip()
+        if not question:
+            _skip(stats, "missing_question")
+            continue
+        accepted_raw = str(row.get("accepted_raw") or "").strip()
+        if not accepted_raw:
+            _skip(stats, "missing_accepted_raw")
+            continue
+
+        is_mcq = bool(row.get("is_mcq"))
+        boxed_values = extract_all_boxed(accepted_raw)
+        if len(boxed_values) != 1 or not str(boxed_values[0]).strip():
+            _skip(stats, "invalid_boxed_shape")
+            continue
+
+        if is_mcq:
+            options = _normalize_options(row.get("options"))
+            if len(options) < 2:
+                _skip(stats, "missing_options_for_mcq")
+                continue
+            labels = [chr(65 + i) for i in range(len(options))]
+            letter = extract_valid_letter(accepted_raw, labels)
+            if not letter:
+                _skip(stats, "missing_or_invalid_mcq_letter")
+                continue
+            prompt = _build_strict_mcq_prompt(question, options)
+            example_type = "mcq"
+        else:
+            prompt = build_reasoning_train_user(question)
+            example_type = "frq"
+
+        target = _enforce_single_final_boxed(accepted_raw)
+        examples.append(
+            {
+                "prompt": prompt,
+                "target": target,
+                "example_type": example_type,
+                "system_prompt": (
+                    "You are solving competition math questions. "
+                    "Provide concise reasoning and end with exactly one final \\boxed{...}."
+                ),
+                "source": "rejection_replay",
+                "target_kind": TARGET_KIND_REAL_REASONING,
             }
         )
 
@@ -1005,6 +1127,9 @@ def _build_adapt_examples(
         # Conservative default: Stage 2 supervises only final-answer formatting.
         if final_answer_only:
             target = _enforce_single_final_boxed("", fallback_answer=extract_boxed(target))
+            target_kind = TARGET_KIND_FINAL_ANSWER_ONLY
+        else:
+            target_kind = TARGET_KIND_LETTER_ONLY if item.get("options") else TARGET_KIND_REAL_REASONING
 
         examples.append(
             {
@@ -1013,6 +1138,7 @@ def _build_adapt_examples(
                 "example_type": "mcq" if item.get("options") else "frq",
                 "system_prompt": system_prompt,
                 "source": "competition_adapt",
+                "target_kind": target_kind,
             }
         )
     return examples
@@ -1056,6 +1182,45 @@ def _mix_examples_with_mcq_weight(
     return mixed
 
 
+def _mix_examples_with_source_weight(
+    examples: list[dict],
+    *,
+    source_name: str,
+    weight: float,
+    seed: int,
+) -> list[dict]:
+    if weight <= 0:
+        raise SystemExit(f"--{source_name}-weight must be > 0.")
+    if not examples or abs(weight - 1.0) < 1e-12:
+        return list(examples)
+
+    rng = random.Random(seed)
+    target = [ex for ex in examples if ex.get("source") == source_name]
+    rest = [ex for ex in examples if ex.get("source") != source_name]
+    if not target:
+        return list(examples)
+
+    weighted: list[dict] = []
+    if weight > 1.0:
+        int_part = int(math.floor(weight))
+        frac = weight - int_part
+        weighted.extend(target * int_part)
+        if frac > 0:
+            n_extra = int(round(len(target) * frac))
+            if n_extra > 0:
+                idxs = sorted(rng.sample(range(len(target)), min(n_extra, len(target))))
+                weighted.extend([target[i] for i in idxs])
+    else:
+        n_keep = int(round(len(target) * weight))
+        if n_keep > 0:
+            idxs = sorted(rng.sample(range(len(target)), min(n_keep, len(target))))
+            weighted.extend([target[i] for i in idxs])
+
+    mixed = rest + weighted
+    rng.shuffle(mixed)
+    return mixed
+
+
 def _print_dataset_samples(name: str, examples: list[dict], n: int = 3) -> None:
     if not examples:
         print(f"[samples:{name}] no samples")
@@ -1063,7 +1228,12 @@ def _print_dataset_samples(name: str, examples: list[dict], n: int = 3) -> None:
     k = min(max(3, n), 5, len(examples))
     print(f"[samples:{name}] showing {k} examples")
     for i, ex in enumerate(examples[:k], start=1):
-        print(f"--- sample {i} ({name}) ---")
+        source = str(ex.get("source") or name)
+        target_kind = str(ex.get("target_kind") or "unknown")
+        print(f"--- sample {i} ---")
+        print(f"Source dataset: {source}")
+        print(f"Target kind: {target_kind} ({_describe_target_kind(target_kind)})")
+        print("Prompt:")
         print(ex.get("prompt", "").strip())
         if ex.get("example_type") == "mcq":
             print(f"Mapped answer letter: {extract_boxed(str(ex.get('target', ''))).upper()}")
@@ -1309,6 +1479,21 @@ def main() -> None:
             dataset_stats["base_replay"] = replay_stats
             all_examples.extend(replay_examples)
 
+        if args.include_rejection_replay:
+            if not args.rejection_replay_path:
+                raise SystemExit("--include-rejection-replay requires --rejection-replay-path.")
+            rr_path = Path(args.rejection_replay_path)
+            if not rr_path.is_absolute():
+                rr_path = root / rr_path
+            rr_examples, rr_stats = _load_rejection_replay_examples(
+                replay_path=rr_path,
+                max_examples=args.max_rejection_replay_examples,
+                seed=args.sample_seed,
+            )
+            dataset_examples["rejection_replay"] = rr_examples
+            dataset_stats["rejection_replay"] = rr_stats
+            all_examples.extend(rr_examples)
+
         if args.stage == "reasoning":
             all_examples = [ex for ex in all_examples if ex.get("example_type") == "frq"]
         elif args.stage == "mcq":
@@ -1317,6 +1502,12 @@ def main() -> None:
         all_examples = _mix_examples_with_mcq_weight(
             all_examples,
             mcq_weight=args.mcq_example_weight,
+            seed=args.sample_seed,
+        )
+        all_examples = _mix_examples_with_source_weight(
+            all_examples,
+            source_name="rejection_replay",
+            weight=float(args.rejection_replay_weight),
             seed=args.sample_seed,
         )
         random.Random(args.sample_seed).shuffle(all_examples)
@@ -1375,6 +1566,15 @@ def main() -> None:
         )
     print(
         f"Totals: mcq={mcq_count} frq={frq_count} final={len(all_examples)} mode={adapter_strategy}"
+    )
+    print(
+        "Source counts: "
+        f"math-mc={dataset_stats.get('math_mc', {}).get('accepted', 0)} "
+        f"CompMath-MCQ={dataset_stats.get('compmath_mcq', {}).get('accepted', 0)} "
+        f"MetaMathQA={dataset_stats.get('metamathqa', {}).get('accepted', 0)} "
+        f"NuminaMath-CoT={dataset_stats.get('numinamath_cot', {}).get('accepted', 0)} "
+        f"base replay={dataset_stats.get('base_replay', {}).get('accepted', 0)} "
+        f"rejection replay={dataset_stats.get('rejection_replay', {}).get('accepted', 0)}"
     )
     print("=" * 60)
 
@@ -1541,6 +1741,13 @@ def main() -> None:
     config_payload["base_replay_path"] = args.base_replay_path
     config_payload["base_replay_count"] = int(dataset_stats.get("base_replay", {}).get("accepted", 0))
     config_payload["base_replay_filter_stats"] = dataset_stats.get("base_replay", {})
+    config_payload["include_rejection_replay"] = bool(args.include_rejection_replay)
+    config_payload["rejection_replay_path"] = args.rejection_replay_path
+    config_payload["rejection_replay_weight"] = float(args.rejection_replay_weight)
+    config_payload["rejection_replay_count"] = int(
+        dataset_stats.get("rejection_replay", {}).get("accepted", 0)
+    )
+    config_payload["rejection_replay_filter_stats"] = dataset_stats.get("rejection_replay", {})
     config_payload["dataset_stats"] = dataset_stats
     config_payload["final_mcq_count"] = mcq_count
     config_payload["final_frq_count"] = frq_count

@@ -9,6 +9,7 @@ from pathlib import Path
 
 from cli_utils import resolve_input_path
 from evaluation import _safe_auto_judge
+from formatting_diagnostics import score_output
 from text_processing import extract_all_boxed, extract_valid_letter
 
 
@@ -80,7 +81,17 @@ def evaluate_run_path(run_path: Path, *, input_path: Path) -> dict:
     mcq_total_with_pred = 0
     total_generated_tokens = 0
     generated_token_samples = 0
+    mcq_generated_tokens = 0
+    mcq_generated_token_samples = 0
     extractor_counts: dict[str, int] = {}
+    extractor_total: dict[str, int] = {}
+    extractor_correct: dict[str, int] = {}
+    finalizer_count = 0
+    raw_letter_recovered_count = 0
+    raw_post_trunc_count = 0
+    repetition_loop_count = 0
+    training_echo_count = 0
+    boxed_count_in_raw_gt1 = 0
     per_question: dict[int, bool] = {}
 
     for item in data:
@@ -129,6 +140,32 @@ def evaluate_run_path(run_path: Path, *, input_path: Path) -> dict:
             mcq_total_with_pred += 1
             if len(boxed_values) == 1 and bool(extract_valid_letter(pred, labels)):
                 mcq_valid_boxed += 1
+            finalizer_count += int(bool(meta.get("finalizer_used")))
+            raw_letter_recovered_count += int(bool(meta.get("raw_letter_recovered")))
+            raw_post_trunc_count += int(bool(meta.get("raw_was_post_truncated")))
+            training_echo_count += int(bool(meta.get("training_echo_detected")))
+            boxed_count_in_raw_gt1 += int(int(meta.get("boxed_count_in_raw") or 0) > 1)
+            if isinstance(n_tokens, (int, float)):
+                mcq_generated_tokens += int(n_tokens)
+                mcq_generated_token_samples += 1
+
+            raw_text = str(rec.get("raw") or meta.get("raw") or "")
+            diag = score_output(
+                raw=raw_text,
+                response=pred,
+                is_mcq=True,
+                labels=labels,
+                n_tokens=int(meta.get("n_tokens") or 0),
+                pre_trunc_n_tokens=meta.get("pre_trunc_n_tokens"),
+                generation_hit_max=bool(meta.get("generation_hit_max")),
+            )
+            repetition_loop_count += int(
+                int(diag.get("repeated_boxed_answers", 0)) >= 2
+                or int(diag.get("repeated_phrase_after_box", 0)) >= 2
+            )
+            path = str(meta.get("extractor_path") or "unknown")
+            extractor_total[path] = extractor_total.get(path, 0) + 1
+            extractor_correct[path] = extractor_correct.get(path, 0) + int(ok)
         else:
             free_total += 1
             free_correct += int(ok)
@@ -173,7 +210,26 @@ def evaluate_run_path(run_path: Path, *, input_path: Path) -> dict:
             if generated_token_samples
             else 0.0
         ),
+        "avg_mcq_tokens": (
+            float(mcq_generated_tokens) / float(mcq_generated_token_samples)
+            if mcq_generated_token_samples
+            else 0.0
+        ),
         "extractor_counts": extractor_counts,
+        "extractor_path_accuracy": {
+            k: {
+                "correct": int(extractor_correct.get(k, 0)),
+                "total": int(v),
+                "acc": ((extractor_correct.get(k, 0) / v) * 100.0) if v else 0.0,
+            }
+            for k, v in extractor_total.items()
+        },
+        "finalizer_count": finalizer_count,
+        "raw_letter_recovered_count": raw_letter_recovered_count,
+        "raw_post_trunc_count": raw_post_trunc_count,
+        "repetition_loop_count": repetition_loop_count,
+        "training_echo_count": training_echo_count,
+        "boxed_count_in_raw_gt1": boxed_count_in_raw_gt1,
         "per_question_correct": per_question,
     }
 
@@ -198,10 +254,10 @@ def _format_summary(results: list[dict]) -> str:
     lines.append("# Run Comparison")
     lines.append("")
     lines.append(
-        "| run | total | overall | mcq | free | mcq_valid_box | empty_boxed | malformed | truncated | guessed | fallback | avg_tokens |"
+        "| run | total | overall | mcq | free | mcq_valid_box | empty_boxed | malformed | truncated | guessed | fallback | finalizer | raw_recovered | repeat_loop | avg_mcq_tokens |"
     )
     lines.append(
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
     )
     for res in results:
         run_name = Path(res["run_path"]).name
@@ -210,7 +266,8 @@ def _format_summary(results: list[dict]) -> str:
             f"{res['free_acc']:.2f}% | {res['mcq_valid_boxed_rate']:.2f}% | "
             f"{res['empty_boxed_count']} | {res['malformed_output_count']} | "
             f"{res['truncation_count']} | {res['guessed_letter_count']} | "
-            f"{res['fallback_count']} | {res['avg_generated_tokens']:.1f} |"
+            f"{res['fallback_count']} | {res['finalizer_count']} | {res['raw_letter_recovered_count']} | "
+            f"{res['repetition_loop_count']} | {res['avg_mcq_tokens']:.1f} |"
         )
     return "\n".join(lines) + "\n"
 

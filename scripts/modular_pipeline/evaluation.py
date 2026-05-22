@@ -7,6 +7,7 @@ from typing import Optional
 
 from tqdm import tqdm
 
+from formatting_diagnostics import score_output
 from text_processing import extract_all_boxed, extract_valid_letter, iter_boxed_spans
 
 
@@ -100,6 +101,17 @@ def evaluate_with_judger(data: list[dict], records_by_id: dict) -> None:
     mcq_invalid_boxed = 0
     mcq_generation_hit_max = 0
     mcq_finalizer_used = 0
+    mcq_raw_was_post_truncated = 0
+    mcq_training_echo = 0
+    mcq_raw_letter_recovered = 0
+    mcq_guessed_letter_used = 0
+    mcq_avg_tokens_total = 0
+    mcq_avg_tokens_count = 0
+    mcq_repetition_loop_detected = 0
+    mcq_boxed_count_gt1_raw = 0
+    recovery_path_counts: dict[str, int] = {}
+    extractor_total: dict[str, int] = {}
+    extractor_correct: dict[str, int] = {}
 
     for item in tqdm(data, desc="Scoring with Judger"):
         answer = item.get("answer")
@@ -162,6 +174,35 @@ def evaluate_with_judger(data: list[dict], records_by_id: dict) -> None:
             mcq_finalizer_used += int(bool(meta.get("finalizer_used")))
             mcq_empty_boxed += int(any(not str(v).strip() for v in boxed_values))
             mcq_invalid_boxed += int(bool(boxed_values) and not final_is_strict_valid)
+            mcq_raw_was_post_truncated += int(bool(meta.get("raw_was_post_truncated")))
+            mcq_training_echo += int(bool(meta.get("training_echo_detected")))
+            mcq_raw_letter_recovered += int(bool(meta.get("raw_letter_recovered")))
+            mcq_guessed_letter_used += int(bool(meta.get("guessed_letter_used")))
+            mcq_avg_tokens_total += int(meta.get("n_tokens") or 0)
+            mcq_avg_tokens_count += 1
+            mcq_boxed_count_gt1_raw += int(int(meta.get("boxed_count_in_raw") or 0) > 1)
+
+            rp = str(meta.get("raw_letter_recovery_path") or "")
+            if rp:
+                recovery_path_counts[rp] = recovery_path_counts.get(rp, 0) + 1
+
+            diag = score_output(
+                raw=raw_text,
+                response=pred,
+                is_mcq=True,
+                labels=labels,
+                n_tokens=int(meta.get("n_tokens") or 0),
+                pre_trunc_n_tokens=meta.get("pre_trunc_n_tokens"),
+                generation_hit_max=bool(meta.get("generation_hit_max")),
+            )
+            mcq_repetition_loop_detected += int(
+                int(diag.get("repeated_boxed_answers", 0)) >= 2
+                or int(diag.get("repeated_phrase_after_box", 0)) >= 2
+            )
+
+            path = str(meta.get("extractor_path") or "unknown")
+            extractor_total[path] = extractor_total.get(path, 0) + 1
+            extractor_correct[path] = extractor_correct.get(path, 0) + int(ok)
         else:
             free_total += 1
             free_correct += int(ok)
@@ -217,8 +258,40 @@ def evaluate_with_judger(data: list[dict], records_by_id: dict) -> None:
             f"({acc(mcq_generation_hit_max, mcq_total):.2f}%), "
             f"finalizer_used={mcq_finalizer_used}/{mcq_total} ({acc(mcq_finalizer_used, mcq_total):.2f}%)"
         )
+        print(
+            "  MCQ diagnostics: "
+            f"avg_tokens={(mcq_avg_tokens_total / mcq_avg_tokens_count) if mcq_avg_tokens_count else 0.0:.1f}, "
+            f"raw_post_truncated={mcq_raw_was_post_truncated}/{mcq_total} "
+            f"({acc(mcq_raw_was_post_truncated, mcq_total):.2f}%), "
+            f"raw_letter_recovered={mcq_raw_letter_recovered}/{mcq_total} "
+            f"({acc(mcq_raw_letter_recovered, mcq_total):.2f}%)"
+        )
+        print(
+            "  MCQ safeguards: "
+            f"guessed_letter_used={mcq_guessed_letter_used}/{mcq_total} "
+            f"({acc(mcq_guessed_letter_used, mcq_total):.2f}%), "
+            f"training_echo={mcq_training_echo}/{mcq_total} ({acc(mcq_training_echo, mcq_total):.2f}%), "
+            f"repetition_loop_detected={mcq_repetition_loop_detected}/{mcq_total} "
+            f"({acc(mcq_repetition_loop_detected, mcq_total):.2f}%)"
+        )
+        print(
+            "  MCQ raw shape : "
+            f"boxed_count_in_raw>1={mcq_boxed_count_gt1_raw}/{mcq_total} "
+            f"({acc(mcq_boxed_count_gt1_raw, mcq_total):.2f}%)"
+        )
     if extractor_counts:
         top_paths = sorted(extractor_counts.items(), key=lambda x: -x[1])[:12]
         paths_str = ", ".join(f"{k}={v}" for k, v in top_paths)
         print(f"  Extractor paths (top): {paths_str}")
+    if recovery_path_counts:
+        top_recovery = sorted(recovery_path_counts.items(), key=lambda x: -x[1])[:8]
+        rec_str = ", ".join(f"{k}={v}" for k, v in top_recovery)
+        print(f"  Raw letter recovery paths: {rec_str}")
+    if extractor_total:
+        ranked = sorted(extractor_total.items(), key=lambda x: -x[1])[:10]
+        parts = []
+        for path, total in ranked:
+            correct = extractor_correct.get(path, 0)
+            parts.append(f"{path}={correct}/{total} ({acc(correct, total):.1f}%)")
+        print("  Extractor path accuracy: " + ", ".join(parts))
     print("=" * 50)
