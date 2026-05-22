@@ -81,7 +81,8 @@ STAGE2_TRAIN_LIMIT_FREE = 25
 # MCQ generation settings
 # ============================================================
 
-# Room to finish reasoning and emit a final \\boxed{X} (truncation hurts correctness).
+# Match base-style budget so the model can derive before boxing the letter (low caps
+# caused shallow "the correct answer is ..." outputs on LoRA adapters).
 MAX_TOKENS_MCQ = 6144
 
 # Ignored by vLLM backend, kept for compatibility with older HF path.
@@ -101,8 +102,8 @@ TEMP_MCQ = 0.0
 TOP_P_MCQ = 1.0
 TOP_K_MCQ = 0
 
-# Mild repetition penalty helps reduce MCQ loop failures without heavily biasing decoding.
-REP_PEN_MCQ = 1.05
+# Mild repetition penalty; keep below free-form so long reasoning stays possible.
+REP_PEN_MCQ = 1.08
 REP_PEN_MCQ_FINAL = 1.0
 
 
@@ -110,7 +111,8 @@ REP_PEN_MCQ_FINAL = 1.0
 # Stop / truncation settings
 # ============================================================
 
-MIN_TOKENS_BEFORE_BOXED_STOP = 256
+# Ignore very early tentative \\boxed{letter} before enough reasoning tokens exist.
+MIN_TOKENS_BEFORE_BOXED_STOP = 128
 
 POST_BOX_PATIENCE_TOKENS_FREE = 256
 POST_BOX_PATIENCE_TOKENS_MCQ = 0
@@ -122,8 +124,8 @@ FINAL_ANSWER_CUE_WINDOW_CHARS = 600
 # Optional n-gram blocking
 # ============================================================
 
-# Keep MCQ disabled; enable a small value for free-form to prevent phrase loops.
-NO_REPEAT_NGRAM_SIZE_MCQ = 0
+# Light MCQ n-gram block: reduces loops without forcing one-line template answers.
+NO_REPEAT_NGRAM_SIZE_MCQ = 4
 NO_REPEAT_NGRAM_SIZE_MCQ_FINAL = 0
 NO_REPEAT_NGRAM_SIZE_FREE = 8
 
@@ -132,8 +134,8 @@ NO_REPEAT_NGRAM_SIZE_FREE = 8
 # Free-form generation settings
 # ============================================================
 
-# Limit long free-form runaway loops while leaving room for multi-part answers.
-MAX_TOKENS_FREE = 3072
+# Align with high-token base runs; post-box patience + n-gram still limit runaway loops.
+MAX_TOKENS_FREE = 8192
 
 # Ignored by vLLM backend, kept for compatibility with older HF path.
 THINK_BUDGET_FREE = 0
@@ -156,6 +158,7 @@ FREE_BATCH_SIZE = 2
 # Thinking mode toggles
 # ============================================================
 
+# Qwen3-Thinking: enable internal reasoning for MCQ; keep finalizer/free paths concise.
 ENABLE_THINKING_MCQ_PRIMARY = True
 ENABLE_THINKING_MCQ_FINAL = False
 ENABLE_THINKING_FREE = False
@@ -166,11 +169,13 @@ ENABLE_THINKING_FREE = False
 
 SYSTEM_PROMPT_MCQ = (
     "You are solving a multiple-choice math problem. "
-    "You may think step by step, but the final line must be exactly one "
-    "boxed option letter from the listed choices, like \\boxed{A}. "
-    "Do not box numbers or expressions. "
+    "Show explicit calculations and compare options using math. "
+    "Do not answer with only a phrase like 'the correct answer is'. "
+    "Derive the result first, then state the final option letter. "
+    "End with exactly one \\boxed{...} containing only a single option letter (A, B, C, ...). "
+    "Do not box numbers, expressions, or intermediate results. "
     "Do not output more than one \\boxed{...}. "
-    "Stop immediately after that final box."
+    "Stop immediately after that final letter box."
 )
 
 SYSTEM_PROMPT_FREE = (
@@ -192,5 +197,6 @@ MCQ_FEWSHOT = (
     "B. 5\n"
     "C. 6\n"
     "D. 7\n\n"
+    "Compute 2+3=5, which matches option B.\n"
     "\\boxed{B}\n\n"
 )
