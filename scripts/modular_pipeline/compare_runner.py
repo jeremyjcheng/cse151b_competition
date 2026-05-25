@@ -27,6 +27,7 @@ import gc
 import json
 import os
 import sys
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -130,6 +131,15 @@ def _parse_args() -> argparse.Namespace:
         default=MAX_TOKENS_FREE,
     )
     parser.add_argument(
+        "--lora-only",
+        action="store_true",
+        help=(
+            "Run only the LoRA inference pass (skip base). Writes "
+            "{stem}_lora_outputs.jsonl only; no comparison report. "
+            "Score with compare_runs.py on that file."
+        ),
+    )
+    parser.add_argument(
         "--compare-mode",
         choices=("sequential", "shared"),
         default="sequential",
@@ -163,6 +173,16 @@ def _parse_args() -> argparse.Namespace:
         help=(
             "Skip judger-based truth_winner computation even when gold is "
             "present. The deploy_winner column is still produced."
+        ),
+    )
+    parser.add_argument(
+        "--judge-timeout-s",
+        type=float,
+        default=1.0,
+        help=(
+            "Per-item sympy judger timeout during comparison (default 1.0s). "
+            "Lower is faster but may mark hard items wrong. Use "
+            "--no-eval-comparison to skip judger entirely."
         ),
     )
 
@@ -309,9 +329,12 @@ def _run_sequential(
 ) -> None:
     from model_pipeline import ModularPipeline
 
-    base_done = _load_done_ids(base_outputs_path)
-    base_remaining = [item for item in data if item.get("id") not in base_done]
-    if base_remaining:
+    if getattr(args, "lora_only", False):
+        print("[sequential] --lora-only: skipping base pass.")
+    else:
+        base_done = _load_done_ids(base_outputs_path)
+        base_remaining = [item for item in data if item.get("id") not in base_done]
+    if not getattr(args, "lora_only", False) and base_remaining:
         print("[sequential] === BASE PASS ===")
         base_pipe = ModularPipeline(
             gpu_id=args.gpu_id,
@@ -340,7 +363,7 @@ def _run_sequential(
                     torch.cuda.empty_cache()
             except Exception:
                 pass
-    else:
+    elif not getattr(args, "lora_only", False):
         print("[sequential] base pass already complete; skipping.")
 
     lora_done = _load_done_ids(lora_outputs_path)
@@ -399,8 +422,12 @@ def _run_shared(
     )
 
     try:
+        if getattr(args, "lora_only", False):
+            print("[shared] --lora-only: skipping base pass.")
         base_done = _load_done_ids(base_outputs_path)
-        if any(item.get("id") not in base_done for item in data):
+        if not getattr(args, "lora_only", False) and any(
+            item.get("id") not in base_done for item in data
+        ):
             print("[shared] === BASE PASS (lora_active=False) ===")
             pipe.set_lora_active(False)
             _run_pipeline_pass(
@@ -441,6 +468,7 @@ def _build_comparison_rows(
     lora_records: dict,
     *,
     use_judger: bool,
+    judge_timeout_s: float = 1.0,
 ) -> tuple[list[dict], Any]:
     """Combine the two pass JSONLs into per-item comparison rows.
 
@@ -449,18 +477,24 @@ def _build_comparison_rows(
     """
     judger_instance = None
     if use_judger:
+        print(
+            "Loading Judger for truth metrics (sympy import can take 30-60s on "
+            "first use)..."
+        )
         JudgerCls = _load_project_judger()
         if JudgerCls is not None:
             try:
                 judger_instance = JudgerCls(strict_extract=False)
+                print("Judger ready.")
             except Exception as exc:
                 print(f"Could not init Judger for comparison: {exc}")
                 judger_instance = None
 
     rows: list[dict] = []
     missing_ids: list = []
+    judge_fn = partial(_safe_auto_judge, timeout_s=float(judge_timeout_s))
 
-    for item in data:
+    for item in tqdm(data, desc="Comparing base vs LoRA"):
         item_id = item.get("id")
         is_mcq = bool(item.get("options"))
         options = list(item.get("options") or [])
@@ -557,7 +591,7 @@ def _build_comparison_rows(
                 gold=gold,
                 options=options,
                 judger=judger_instance,
-                safe_auto_judge=_safe_auto_judge,
+                safe_auto_judge=judge_fn,
             )
             row["truth_winner"] = truth["truth_winner"]
             row["base_correct"] = truth["base_correct"]
@@ -567,7 +601,7 @@ def _build_comparison_rows(
             gold_list = gold if isinstance(gold, list) else [gold]
             options_per_slot = [options or []] * len(gold_list)
             row["deploy_correct"] = bool(
-                _safe_auto_judge(
+                judge_fn(
                     judger_instance,
                     pred=deploy["deploy_response"],
                     gold=gold_list,
@@ -858,11 +892,31 @@ def main() -> None:
     else:
         _run_shared(args, data, base_outputs_path, lora_outputs_path)
 
+    if args.lora_only:
+        print(f"LoRA-only run complete: {lora_outputs_path.resolve()}")
+        print(
+            "Score with: python scripts/modular_pipeline/compare_runs.py "
+            f"--input public --limit-mcq {args.limit_mcq} --limit-free {args.limit_free} "
+            f"--sample-seed {args.sample_seed} --runs {lora_outputs_path}"
+        )
+        return
+
+    print("Loading saved base/LoRA outputs...")
     base_records = _load_records_by_id(base_outputs_path)
     lora_records = _load_records_by_id(lora_outputs_path)
+    print(
+        f"Loaded {len(base_records)} base + {len(lora_records)} lora records; "
+        f"building comparison for {len(data)} items "
+        f"(judger={'on' if use_judger else 'off'})..."
+    )
 
     rows, _judger = _build_comparison_rows(
-        args, data, base_records, lora_records, use_judger=use_judger
+        args,
+        data,
+        base_records,
+        lora_records,
+        use_judger=use_judger,
+        judge_timeout_s=args.judge_timeout_s,
     )
 
     with open(comparison_path, "w") as f:

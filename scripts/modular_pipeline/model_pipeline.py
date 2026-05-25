@@ -36,6 +36,17 @@ from settings import (
     MCQ_VERIFY_ENABLED,
     MCQ_VERIFY_MAX_FRACTION,
     MCQ_VERIFY_TRIGGER_MIN_SCORE,
+    LORA_MAX_TOKENS_FREE,
+    LORA_MAX_TOKENS_MCQ,
+    LORA_MIN_NEW_TOKENS_FREE,
+    LORA_MIN_NEW_TOKENS_MCQ,
+    LORA_MIN_TOKENS_BEFORE_BOXED_STOP,
+    LORA_NO_REPEAT_NGRAM_SIZE_FREE,
+    LORA_POST_BOX_PATIENCE_TOKENS_FREE,
+    LORA_POST_BOX_PATIENCE_TOKENS_MCQ,
+    LORA_REP_PEN_FREE,
+    LORA_REP_PEN_MCQ,
+    LORA_STOP_AT_FIRST_CLEAN_BOXED,
     MIN_TOKENS_BEFORE_BOXED_STOP,
     MODEL_ID,
     NO_REPEAT_NGRAM_SIZE_FREE,
@@ -435,6 +446,18 @@ class ModularPipeline:
                 add_generation_prompt=True,
             )
 
+    def _effective_max_new_tokens(self, *, is_mcq: bool) -> int:
+        if self._lora_active:
+            return LORA_MAX_TOKENS_MCQ if is_mcq else LORA_MAX_TOKENS_FREE
+        return self.mcq_max_new_tokens if is_mcq else self.free_max_new_tokens
+
+    def _lora_generation_floors(self, *, is_mcq: bool) -> tuple[int | None, int]:
+        """(vLLM min_tokens, min prefix tokens before boxed post-truncation)."""
+        if not self._lora_active:
+            return None, MIN_TOKENS_BEFORE_BOXED_STOP
+        min_new = LORA_MIN_NEW_TOKENS_MCQ if is_mcq else LORA_MIN_NEW_TOKENS_FREE
+        return (int(min_new) if int(min_new) > 0 else None), LORA_MIN_TOKENS_BEFORE_BOXED_STOP
+
     @staticmethod
     def _build_vllm_sampling_params(
         *,
@@ -446,6 +469,7 @@ class ModularPipeline:
         do_sample: bool,
         no_repeat_ngram_size: int = 0,
         seed: int | None = None,
+        min_tokens: int | None = None,
     ):
         """Map HF-style do_sample to vLLM SamplingParams.
 
@@ -477,6 +501,11 @@ class ModularPipeline:
         if no_repeat_ngram_size and no_repeat_ngram_size > 0:
             sampling_kwargs["no_repeat_ngram_size"] = no_repeat_ngram_size
 
+        if min_tokens is not None and int(min_tokens) > 0:
+            floor = min(int(min_tokens), max(0, int(max_tokens) - 1))
+            if floor > 0:
+                sampling_kwargs["min_tokens"] = floor
+
         try:
             return SamplingParams(**sampling_kwargs)
         except TypeError:
@@ -489,6 +518,7 @@ class ModularPipeline:
         raw_clean: str,
         mcq_valid: set[str] | None,
         post_box_patience_tokens: int,
+        min_tokens_before_boxed_stop: int | None = None,
     ) -> str:
         """Post-hoc truncate to a likely-final boxed span.
 
@@ -498,10 +528,15 @@ class ModularPipeline:
         if not spans:
             return raw_clean
 
+        min_prefix = (
+            int(min_tokens_before_boxed_stop)
+            if min_tokens_before_boxed_stop is not None
+            else MIN_TOKENS_BEFORE_BOXED_STOP
+        )
+
         if mcq_valid is not None:
             valid_upper = {str(x).strip().upper() for x in mcq_valid}
 
-            valid_spans: list[tuple[int, int, bool]] = []
             valid_spans: list[tuple[int, int, bool]] = []
             for start, end, inner in spans:
                 cand = _mcq_letter_from_boxed_inner(inner, valid_upper)
@@ -510,7 +545,7 @@ class ModularPipeline:
 
                 prefix = raw_clean[:end]
                 prefix_tokens = len(self.tokenizer.encode(prefix, add_special_tokens=False))
-                if prefix_tokens < MIN_TOKENS_BEFORE_BOXED_STOP:
+                if prefix_tokens < min_prefix:
                     continue
 
                 cue_window = max(0, int(FINAL_ANSWER_CUE_WINDOW_CHARS))
@@ -518,22 +553,14 @@ class ModularPipeline:
                 context = raw_clean[context_start:start]
                 cue_hit = bool(_FINAL_CUE_RE.search(context))
                 valid_spans.append((start, end, cue_hit))
-                cue_window = max(0, int(FINAL_ANSWER_CUE_WINDOW_CHARS))
-                context_start = max(0, start - cue_window)
-                context = raw_clean[context_start:start]
-                cue_hit = bool(_FINAL_CUE_RE.search(context))
-                valid_spans.append((start, end, cue_hit))
 
             if valid_spans:
-                # Prefer a cue-aligned final answer box; otherwise keep the last
-                # valid boxed letter so mid-reasoning tentative choices do not win.
-                cue_spans = [span for span in valid_spans if span[2]]
-                chosen = cue_spans[-1] if cue_spans else valid_spans[-1]
-                _start, end, _cue_hit = chosen
-                # Prefer a cue-aligned final answer box; otherwise keep the last
-                # valid boxed letter so mid-reasoning tentative choices do not win.
-                cue_spans = [span for span in valid_spans if span[2]]
-                chosen = cue_spans[-1] if cue_spans else valid_spans[-1]
+                if self._lora_active and LORA_STOP_AT_FIRST_CLEAN_BOXED:
+                    cue_spans = [span for span in valid_spans if span[2]]
+                    chosen = cue_spans[0] if cue_spans else valid_spans[0]
+                else:
+                    cue_spans = [span for span in valid_spans if span[2]]
+                    chosen = cue_spans[-1] if cue_spans else valid_spans[-1]
                 _start, end, _cue_hit = chosen
                 if post_box_patience_tokens > 0:
                     suffix = raw_clean[end:]
@@ -547,7 +574,12 @@ class ModularPipeline:
             # Do not truncate MCQ output to a random non-letter box.
             return raw_clean.rstrip()
 
-        # Free-form: keep up to the last complete boxed span.
+        # Free-form: base keeps through last box; LoRA stops at first non-empty box.
+        if self._lora_active and LORA_STOP_AT_FIRST_CLEAN_BOXED:
+            for _start, end, inner in spans:
+                if str(inner).strip():
+                    return raw_clean[:end].rstrip()
+            return raw_clean.rstrip()
         return raw_clean[: spans[-1][1]].rstrip()
 
     def _generate_batch(
@@ -568,6 +600,8 @@ class ModularPipeline:
         post_box_patience_tokens: int = POST_BOX_PATIENCE_TOKENS_FREE,
         no_repeat_ngram_size: int = 0,
         sampling_seed: int | None = None,
+        min_new_tokens: int | None = None,
+        min_tokens_before_boxed_stop: int | None = None,
     ) -> list[dict]:
         # vLLM cannot enforce your old token-level think_budget logic.
         del think_budget
@@ -586,7 +620,16 @@ class ModularPipeline:
             do_sample=do_sample,
             no_repeat_ngram_size=no_repeat_ngram_size,
             seed=sampling_seed,
+            min_tokens=min_new_tokens,
         )
+        if self._lora_active and self._generate_call_count == 0:
+            print(
+                f"[lora] inference caps: max_tokens={max_new_tokens} "
+                f"min_tokens={min_new_tokens or 0} "
+                f"first_clean_boxed={LORA_STOP_AT_FIRST_CLEAN_BOXED} "
+                f"adapter={self.lora_adapter_path!r}",
+                flush=True,
+            )
 
         llm_kwargs: dict[str, Any] = dict(
             sampling_params=sampling_params,
@@ -613,6 +656,7 @@ class ModularPipeline:
                         raw_clean=raw_clean,
                         mcq_valid=mcq_valid,
                         post_box_patience_tokens=post_box_patience_tokens,
+                        min_tokens_before_boxed_stop=min_tokens_before_boxed_stop,
                     )
                 pre_trunc_tokens = len(
                     self.tokenizer.encode(raw_before_trunc, add_special_tokens=False)
@@ -686,6 +730,7 @@ class ModularPipeline:
                     raw_clean=raw_clean,
                     mcq_valid=mcq_valid,
                     post_box_patience_tokens=post_box_patience_tokens,
+                    min_tokens_before_boxed_stop=min_tokens_before_boxed_stop,
                 )
 
             pre_trunc_tokens = len(self.tokenizer.encode(raw_before_trunc, add_special_tokens=False))
@@ -885,22 +930,32 @@ class ModularPipeline:
             for item in items
         ]
 
+        lora_min_tokens, lora_min_before_box = self._lora_generation_floors(is_mcq=True)
+        mcq_max = self._effective_max_new_tokens(is_mcq=True)
+        post_patience = (
+            LORA_POST_BOX_PATIENCE_TOKENS_MCQ
+            if self._lora_active
+            else POST_BOX_PATIENCE_TOKENS_MCQ
+        )
+        rep_pen = LORA_REP_PEN_MCQ if self._lora_active else REP_PEN_MCQ
         primary_outputs = self._generate_batch(
             system_prompts,
             user_prompts,
-            max_new_tokens=self.mcq_max_new_tokens,
+            max_new_tokens=mcq_max,
             temperature=TEMP_MCQ if temperature is None else float(temperature),
             top_p=TOP_P_MCQ if top_p is None else float(top_p),
             top_k=TOP_K_MCQ if top_k is None else int(top_k),
-            repetition_penalty=REP_PEN_MCQ,
+            repetition_penalty=rep_pen,
             do_sample=bool(do_sample),
             think_budget=0,
             enable_thinking=ENABLE_THINKING_MCQ_PRIMARY,
             force_smart_boxed_stop=True,
             mcq_valid_per_row=mcq_valid,
-            post_box_patience_tokens=POST_BOX_PATIENCE_TOKENS_MCQ,
+            post_box_patience_tokens=post_patience,
             no_repeat_ngram_size=NO_REPEAT_NGRAM_SIZE_MCQ,
             sampling_seed=sampling_seed,
+            min_new_tokens=lora_min_tokens,
+            min_tokens_before_boxed_stop=lora_min_before_box,
         )
 
         solved: list[dict | None] = [None] * len(items)
@@ -1147,28 +1202,44 @@ class ModularPipeline:
             return []
         print(
             f"[debug] solve_free_batch: batch_size={len(items)} "
-            f"free_max_new_tokens={self.free_max_new_tokens}",
+            f"free_max_new_tokens={self._effective_max_new_tokens(is_mcq=False)} "
+            f"lora_active={self._lora_active}",
             flush=True,
         )
 
         user_prompts = [build_free_user(item["question"]) for item in items]
         system_prompts = [SYSTEM_PROMPT_FREE] * len(items)
 
+        lora_min_tokens, lora_min_before_box = self._lora_generation_floors(is_mcq=False)
+        free_max = self._effective_max_new_tokens(is_mcq=False)
+        post_patience = (
+            LORA_POST_BOX_PATIENCE_TOKENS_FREE
+            if self._lora_active
+            else POST_BOX_PATIENCE_TOKENS_FREE
+        )
+        ngram = (
+            LORA_NO_REPEAT_NGRAM_SIZE_FREE
+            if self._lora_active
+            else NO_REPEAT_NGRAM_SIZE_FREE
+        )
+        rep_pen = LORA_REP_PEN_FREE if self._lora_active else REP_PEN_FREE
         outputs = self._generate_batch(
             system_prompts,
             user_prompts,
-            max_new_tokens=self.free_max_new_tokens,
+            max_new_tokens=free_max,
             temperature=TEMP_FREE if temperature is None else float(temperature),
             top_p=TOP_P_FREE if top_p is None else float(top_p),
             top_k=TOP_K_FREE if top_k is None else int(top_k),
-            repetition_penalty=REP_PEN_FREE,
+            repetition_penalty=rep_pen,
             do_sample=bool(do_sample),
             think_budget=0,
             force_smart_boxed_stop=True,
             mcq_valid_per_row=None,
-            post_box_patience_tokens=POST_BOX_PATIENCE_TOKENS_FREE,
-            no_repeat_ngram_size=NO_REPEAT_NGRAM_SIZE_FREE,
+            post_box_patience_tokens=post_patience,
+            no_repeat_ngram_size=ngram,
             sampling_seed=sampling_seed,
+            min_new_tokens=lora_min_tokens,
+            min_tokens_before_boxed_stop=lora_min_before_box,
         )
 
         solved: list[dict] = []

@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
+import sys
 from pathlib import Path
+from typing import Any
 
-from cli_utils import resolve_input_path
-from evaluation import _safe_auto_judge
+from tqdm import tqdm
+
+from cli_utils import apply_subset_caps, resolve_input_path
+from evaluation import _load_project_judger, _safe_auto_judge
 from formatting_diagnostics import score_output
 from text_processing import extract_all_boxed, extract_valid_letter
 
@@ -18,16 +21,6 @@ def _discover_project_root(start: Path) -> Path:
         if (candidate / "data").exists():
             return candidate
     return start.parent
-
-
-def _load_project_judger():
-    judger_path = Path(__file__).resolve().parents[2] / "judger.py"
-    spec = importlib.util.spec_from_file_location("project_judger", judger_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Could not import judger from {judger_path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module.Judger
 
 
 def _load_input_data(input_path: Path) -> list[dict]:
@@ -60,12 +53,37 @@ def _load_records_by_id(output_path: Path) -> dict:
     return records_by_id
 
 
-def evaluate_run_path(run_path: Path, *, input_path: Path) -> dict:
+def evaluate_run_path(
+    run_path: Path,
+    *,
+    data: list[dict],
+    judger: Any,
+    judge_timeout_s: float = 1.0,
+    light_diagnostics: bool = False,
+) -> dict:
     output_path = _resolve_run_output(run_path)
-    data = _load_input_data(input_path)
+    run_label = output_path.name
+    print(f"\n=== Scoring run: {run_label} ===", flush=True)
+    print(f"    output: {output_path}", flush=True)
+
     records_by_id = _load_records_by_id(output_path)
-    Judger = _load_project_judger()
-    judger = Judger(strict_extract=False)
+    print(f"    loaded {len(records_by_id)} predictions from JSONL", flush=True)
+
+    id_set = set(records_by_id.keys())
+    items = [
+        item
+        for item in data
+        if item.get("id") in id_set and "answer" in item
+    ]
+    print(
+        f"    judging {len(items)} items against public gold "
+        f"(timeout={judge_timeout_s}s per check)",
+        flush=True,
+    )
+    if not items:
+        raise RuntimeError(
+            f"No overlapping ids between input ({len(data)} rows) and {output_path}"
+        )
 
     mcq_total = mcq_correct = 0
     free_total = free_correct = 0
@@ -94,13 +112,9 @@ def evaluate_run_path(run_path: Path, *, input_path: Path) -> dict:
     boxed_count_in_raw_gt1 = 0
     per_question: dict[int, bool] = {}
 
-    for item in data:
-        if "answer" not in item:
-            continue
+    for item in tqdm(items, desc=run_label[:40], unit="q"):
         qid = item.get("id")
-        rec = records_by_id.get(qid)
-        if rec is None:
-            continue
+        rec = records_by_id[qid]
         pred = str(rec.get("response") or "")
         meta = rec.get("meta") or {}
         n_tokens = meta.get("n_tokens")
@@ -129,7 +143,13 @@ def evaluate_run_path(run_path: Path, *, input_path: Path) -> dict:
 
         gold = item["answer"] if isinstance(item["answer"], list) else [item["answer"]]
         options_per_slot = [item.get("options", [])] * len(gold)
-        ok = _safe_auto_judge(judger, pred=pred, gold=gold, options_per_slot=options_per_slot)
+        ok = _safe_auto_judge(
+            judger,
+            pred=pred,
+            gold=gold,
+            options_per_slot=options_per_slot,
+            timeout_s=judge_timeout_s,
+        )
         per_question[int(qid)] = bool(ok)
 
         is_mcq = bool(item.get("options"))
@@ -149,20 +169,21 @@ def evaluate_run_path(run_path: Path, *, input_path: Path) -> dict:
                 mcq_generated_tokens += int(n_tokens)
                 mcq_generated_token_samples += 1
 
-            raw_text = str(rec.get("raw") or meta.get("raw") or "")
-            diag = score_output(
-                raw=raw_text,
-                response=pred,
-                is_mcq=True,
-                labels=labels,
-                n_tokens=int(meta.get("n_tokens") or 0),
-                pre_trunc_n_tokens=meta.get("pre_trunc_n_tokens"),
-                generation_hit_max=bool(meta.get("generation_hit_max")),
-            )
-            repetition_loop_count += int(
-                int(diag.get("repeated_boxed_answers", 0)) >= 2
-                or int(diag.get("repeated_phrase_after_box", 0)) >= 2
-            )
+            if not light_diagnostics:
+                raw_text = str(rec.get("raw") or meta.get("raw") or "")
+                diag = score_output(
+                    raw=raw_text,
+                    response=pred,
+                    is_mcq=True,
+                    labels=labels,
+                    n_tokens=int(meta.get("n_tokens") or 0),
+                    pre_trunc_n_tokens=meta.get("pre_trunc_n_tokens"),
+                    generation_hit_max=bool(meta.get("generation_hit_max")),
+                )
+                repetition_loop_count += int(
+                    int(diag.get("repeated_boxed_answers", 0)) >= 2
+                    or int(diag.get("repeated_phrase_after_box", 0)) >= 2
+                )
             path = str(meta.get("extractor_path") or "unknown")
             extractor_total[path] = extractor_total.get(path, 0) + 1
             extractor_correct[path] = extractor_correct.get(path, 0) + int(ok)
@@ -181,6 +202,12 @@ def evaluate_run_path(run_path: Path, *, input_path: Path) -> dict:
 
     def _acc(c: int, t: int) -> float:
         return (100.0 * c / t) if t else 0.0
+
+    print(
+        f"    done: {correct}/{total} correct "
+        f"(MCQ {mcq_correct}/{mcq_total}, free {free_correct}/{free_total})",
+        flush=True,
+    )
 
     return {
         "run_path": str(run_path),
@@ -312,6 +339,35 @@ def parse_args() -> argparse.Namespace:
         help="'public', 'private', or explicit .jsonl path.",
     )
     parser.add_argument(
+        "--limit-mcq",
+        type=int,
+        default=None,
+        help="Cap MCQ items (same seed logic as compare_runner).",
+    )
+    parser.add_argument(
+        "--limit-free",
+        type=int,
+        default=None,
+        help="Cap free-form items (same seed logic as compare_runner).",
+    )
+    parser.add_argument(
+        "--sample-seed",
+        type=int,
+        default=0,
+        help="RNG seed when --limit-mcq/--limit-free are set.",
+    )
+    parser.add_argument(
+        "--judge-timeout-s",
+        type=float,
+        default=1.0,
+        help="Per-item sympy judger timeout (default 1.0).",
+    )
+    parser.add_argument(
+        "--light-diagnostics",
+        action="store_true",
+        help="Skip slow raw-text format diagnostics (accuracy unchanged).",
+    )
+    parser.add_argument(
         "--out",
         default=None,
         help="Optional markdown output path.",
@@ -323,10 +379,36 @@ def main() -> None:
     args = parse_args()
     here = Path(__file__).resolve().parent
     root = _discover_project_root(here)
+    root_str = str(root)
+    if root_str not in sys.path:
+        sys.path.insert(0, root_str)
     input_path = resolve_input_path(args.input, root)
 
+    print(f"Loading gold from {input_path} ...", flush=True)
+    data = _load_input_data(input_path)
+    print(f"  {len(data)} rows in input", flush=True)
+    data = apply_subset_caps(
+        data,
+        limit_mcq=args.limit_mcq,
+        limit_free=args.limit_free,
+        seed=args.sample_seed,
+    )
+
+    print("Loading Judger (sympy; first load can take 30-60s) ...", flush=True)
+    JudgerCls = _load_project_judger()
+    if JudgerCls is None:
+        raise SystemExit("Could not load Judger from project judger.py")
+    judger = JudgerCls(strict_extract=False)
+    print("Judger ready.\n", flush=True)
+
     results = [
-        evaluate_run_path(Path(run).resolve(), input_path=input_path)
+        evaluate_run_path(
+            Path(run).resolve(),
+            data=data,
+            judger=judger,
+            judge_timeout_s=args.judge_timeout_s,
+            light_diagnostics=args.light_diagnostics,
+        )
         for run in args.runs
     ]
     markdown = _format_summary(results)

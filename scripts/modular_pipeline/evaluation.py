@@ -3,6 +3,7 @@
 import importlib.util
 import re
 import signal
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -87,10 +88,15 @@ def _safe_auto_judge(judger, pred: str, gold: list, options_per_slot: list, time
 
 def _load_project_judger() -> Optional[type]:
     """Load `Judger` from this project's `judger.py` explicitly by path."""
-    judger_path = Path(__file__).resolve().parents[2] / "judger.py"
+    root = Path(__file__).resolve().parents[2]
+    judger_path = root / "judger.py"
     if not judger_path.exists():
         print(f"Could not locate project judger at: {judger_path}")
         return None
+
+    root_str = str(root)
+    if root_str not in sys.path:
+        sys.path.insert(0, root_str)
 
     try:
         spec = importlib.util.spec_from_file_location("project_judger", judger_path)

@@ -113,6 +113,25 @@ REP_PEN_MCQ_FINAL = 1.0
 
 # Ignore very early tentative \\boxed{letter} before enough reasoning tokens exist.
 MIN_TOKENS_BEFORE_BOXED_STOP = 128
+<<<<<<< HEAD
+=======
+
+# LoRA inference profile (base keeps MAX_TOKENS_MCQ/FREE above). Forcing min_tokens
+# on a FRQ-only Stage-1 adapter caused loops, many \\boxed{}, and hit max length.
+# Do not set LORA_MIN_NEW_TOKENS_* above 0.
+LORA_MIN_NEW_TOKENS_MCQ = 0
+LORA_MIN_NEW_TOKENS_FREE = 0
+LORA_MAX_TOKENS_MCQ = 1024
+LORA_MAX_TOKENS_FREE = 2048
+LORA_MIN_TOKENS_BEFORE_BOXED_STOP = 128
+LORA_POST_BOX_PATIENCE_TOKENS_FREE = 0
+LORA_POST_BOX_PATIENCE_TOKENS_MCQ = 0
+# Truncate at first valid/clean box (not last) to limit repeat-box loops.
+LORA_STOP_AT_FIRST_CLEAN_BOXED = True
+LORA_REP_PEN_MCQ = 1.12
+LORA_REP_PEN_FREE = 1.15
+LORA_NO_REPEAT_NGRAM_SIZE_FREE = 12
+>>>>>>> 376af72 (Retrying lora)
 
 POST_BOX_PATIENCE_TOKENS_FREE = 256
 POST_BOX_PATIENCE_TOKENS_MCQ = 0
