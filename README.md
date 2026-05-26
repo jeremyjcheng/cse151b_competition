@@ -97,6 +97,14 @@ bash scripts/server/run_full_pipeline.sh
 
 See [`scripts/server/README.md`](scripts/server/README.md) for details.
 
+## Improving accuracy (30% → 60% holdout)
+
+```bash
+bash scripts/server/run_accuracy_plan.sh   # full phase checklist
+```
+
+Key fix: Stage 2 now trains on the **full public train slice** (`STAGE2_TRAIN_LIMIT_* = 0`), not 50+25 examples. Run `iterate_stage1_v2.sh` then `run_stage2_v3.sh` on the GPU server.
+
 ## End-to-end workflow
 
 ```bash

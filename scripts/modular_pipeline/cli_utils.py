@@ -561,6 +561,13 @@ def write_jsonl(path: Path, records: list[dict]) -> None:
             f.write(json.dumps(rec) + "\n")
 
 
+def normalize_train_limit(value: int | None) -> int | None:
+    """Map CLI 0 to no cap (None) for Stage-2 training and eval subsets."""
+    if value is None or value <= 0:
+        return None
+    return value
+
+
 def apply_subset_caps(
     data: list[dict],
     *,
@@ -569,6 +576,8 @@ def apply_subset_caps(
     seed: int,
 ) -> list[dict]:
     """Return a deterministic per-type-capped subset of `data`."""
+    limit_mcq = normalize_train_limit(limit_mcq)
+    limit_free = normalize_train_limit(limit_free)
     if limit_mcq is None and limit_free is None:
         return data
 
@@ -603,10 +612,12 @@ def apply_subset_caps(
 def build_run_stem(input_stem: str, args: argparse.Namespace) -> str:
     """Append a deterministic suffix when subset caps are active."""
     parts: list[str] = []
-    if args.limit_mcq is not None:
-        parts.append(f"mcq{args.limit_mcq}")
-    if args.limit_free is not None:
-        parts.append(f"free{args.limit_free}")
+    mcq_cap = normalize_train_limit(getattr(args, "limit_mcq", None))
+    free_cap = normalize_train_limit(getattr(args, "limit_free", None))
+    if mcq_cap is not None:
+        parts.append(f"mcq{mcq_cap}")
+    if free_cap is not None:
+        parts.append(f"free{free_cap}")
     if not parts:
         return input_stem
     parts.append(f"seed{args.sample_seed}")

@@ -93,3 +93,24 @@ CONDA_ENV_NAME=myenv bash scripts/server/test_installs.sh
 | `GPU_ID` | `0` | CUDA device |
 | `REASONING_STEPS` | `1000` | Stage 1 steps |
 | `ADAPT_STEPS` | `60` | Stage 2 steps |
+
+## 30% → 60% accuracy plan
+
+See full step list:
+
+```bash
+bash scripts/server/run_accuracy_plan.sh
+```
+
+| Phase | Script | Goal |
+|-------|--------|------|
+| 0 | `run_baseline_ladder.sh` | Base vs Stage1 vs Stage2 eval |
+| 1 | `iterate_stage1_v2.sh` | 1500-step reasoning LoRA |
+| 2 | `run_stage2_v3.sh` + `run_stage2_eval_and_pick.sh` | Full public train slice (not 50/25 cap) |
+| 3 | `run_holdout_infer.sh` + `run_curate_stage2_r2.sh` | Hard-example second pass |
+| 4 | Set `MCQ_SELF_CONSISTENCY_SAMPLES=3` in `setting.py` | MCQ majority vote |
+| 5 | `private_submit.sh` | `results/private_submission.csv` |
+
+**Important:** Old Stage 2 runs used only **50 MCQ + 25 free** training examples (`STAGE2_TRAIN_LIMIT_*` now **0 = no cap**). Do not compare new holdout scores to old 1000-step overfit runs directly.
+
+Milestones: **≥38%** Stage1-only | **≥48%** Stage2 v3 | **≥55%** + curation | **≥60%** + self-consistency

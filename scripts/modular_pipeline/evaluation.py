@@ -50,12 +50,14 @@ def _mcq_exact_match(pred: str, gold, labels: list[str]) -> bool:
 
 
 def _free_exact_match(pred: str, gold) -> bool:
+    from text_processing import _normalize_free_inner
+
     pred_boxed = extract_all_boxed(pred)
     if not pred_boxed:
         return False
-    pred_val = pred_boxed[-1].strip()
+    pred_val = _normalize_free_inner(pred_boxed[-1].strip())
     gold_list = _normalize_gold_list(gold)
-    return any(str(g).strip() == pred_val for g in gold_list)
+    return any(_normalize_free_inner(str(g).strip()) == pred_val for g in gold_list)
 
 
 class _JudgeTimeout(Exception):

@@ -70,8 +70,9 @@ ADAPT_DEFAULT_MAX_STEPS = 60
 STAGE2_DEFAULT_HOLDOUT_FRACTION = 0.3
 
 # Cap Stage-2 training size on public data (in addition to holdout split).
-STAGE2_TRAIN_LIMIT_MCQ = 50
-STAGE2_TRAIN_LIMIT_FREE = 25
+# 0 = no cap (use full train slice after holdout). Old defaults 50/25 severely limited SFT.
+STAGE2_TRAIN_LIMIT_MCQ = 0
+STAGE2_TRAIN_LIMIT_FREE = 0
 
 # Stage-2 MCQ: supervise brief reasoning + final letter (not bare \\boxed{A} only).
 STAGE2_MCQ_WITH_REASONING = True
@@ -150,6 +151,10 @@ REP_PEN_FREE = 1.05
 
 MCQ_BATCH_SIZE = 12
 FREE_BATCH_SIZE = 2
+
+# MCQ self-consistency: 0 = disabled; 3 = majority vote over 3 samples (Phase 4).
+MCQ_SELF_CONSISTENCY_SAMPLES = 0
+MCQ_SELF_CONSISTENCY_TEMP = 0.3
 
 # ============================================================
 # Thinking mode toggles

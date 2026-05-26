@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Re-run Stage 2 + eval using an existing Stage 1 adapter
+# Re-run Stage 2 + eval using an existing Stage 1 adapter (v3 recipe: no train caps).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -27,11 +27,11 @@ nohup "$PY" scripts/modular_pipeline/run_lora_workspaces.py \
   --adapter-root workspaces \
   --skip-stage1 \
   --stage1-adapter-path "$STAGE1_ADAPTER" \
-  --adapt-steps 60 \
+  --adapt-steps 200 \
   --stage2-learning-rate 1e-5 \
   --stage2-holdout-fraction 0.3 \
-  --limit-mcq 50 \
-  --limit-free 25 \
+  --limit-mcq 0 \
+  --limit-free 0 \
   --stage2-final-answer-only \
   --no-stage2-train-on-full-chat \
   --stage2-freeze-reasoning-style \

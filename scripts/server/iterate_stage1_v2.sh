@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Phase 2/3: stronger Stage 1 (1500 steps) then Stage 2 only
+# Phase 1: full Stage 1 reasoning (1500 steps, OpenMath + Hendrycks, bf16).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -12,6 +12,11 @@ LOG="logs/stage1_v2_$(date +%Y%m%d_%H%M).log"
 
 mkdir -p logs workspaces
 
+HELP="$("$PY" scripts/modular_pipeline/train_lora.py --help 2>&1)" || true
+EXTRA=()
+if echo "$HELP" | grep -q 'load-in-4bit'; then EXTRA+=(--no-load-in-4bit); fi
+if echo "$HELP" | grep -q 'gradient-checkpointing'; then EXTRA+=(--gradient-checkpointing); fi
+
 echo "=== Stage 1 v2 (1500 steps) -> $STAGE1_OUT ==="
 nohup "$PY" scripts/modular_pipeline/train_lora.py \
   --stage reasoning \
@@ -21,9 +26,13 @@ nohup "$PY" scripts/modular_pipeline/train_lora.py \
   --max-steps 1500 \
   --learning-rate 8e-5 \
   --train-on-full-chat \
+  --save-every-steps 100 \
   --gpu-id "$GPU_ID" \
+  "${EXTRA[@]}" \
   >"$LOG" 2>&1 &
 
 echo $! > logs/stage1_v2.pid
-echo "Stage 1 v2 PID=$(cat logs/stage1_v2.pid). Wait for completion, then run:"
-echo "  STAGE1_ADAPTER=$STAGE1_OUT/final_adapter bash scripts/server/run_stage2_only.sh"
+echo "Stage 1 v2 PID=$(cat logs/stage1_v2.pid). Monitor: tail -f $LOG"
+echo ""
+echo "After completion:"
+echo "  STAGE1_ADAPTER=$STAGE1_OUT/final_adapter bash scripts/server/run_stage2_v3.sh"

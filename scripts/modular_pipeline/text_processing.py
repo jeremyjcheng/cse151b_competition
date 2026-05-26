@@ -360,6 +360,42 @@ _FINAL_ANSWER_CUE_PATTERN = re.compile(
 )
 
 
+def _unwrap_text_cmd(value: str) -> str:
+    """Unwrap simple \\text{...} wrappers."""
+    s = value.strip()
+    m = re.fullmatch(r"\\text\{(.+)\}", s)
+    if m:
+        return m.group(1).strip()
+    return s
+
+
+def _normalize_free_inner(value: str) -> str:
+    """Lightweight normalization to improve free-form EM and judger agreement."""
+    s = _unwrap_text_cmd(value.strip())
+    s = s.strip("$").strip()
+    s = re.sub(r"^\$+|\$+$", "", s)
+    s = s.replace(r"\dfrac", r"\frac").replace(r"\tfrac", r"\frac")
+    s = re.sub(r"\s+", " ", s).strip()
+    if not s:
+        return value.strip()
+    try:
+        from sympy import sympify
+        from sympy.parsing.latex import parse_latex
+
+        expr = None
+        try:
+            expr = parse_latex(s)
+        except Exception:
+            expr = sympify(s.replace("^", "**"))
+        if expr is not None:
+            from sympy import latex
+
+            return latex(expr).strip()
+    except Exception:
+        pass
+    return s
+
+
 def canonicalize_free_response(response: str) -> str:
     """Return exactly one boxed free-response answer using cue-aware selection."""
     out, _meta = canonicalize_free_response_with_meta(response)
@@ -368,7 +404,10 @@ def canonicalize_free_response(response: str) -> str:
 
 def canonicalize_free_response_with_meta(response: str) -> tuple[str, dict]:
     """Return canonical single \\boxed{...} plus extractor diagnostics for FRQ."""
-    ensured = ensure_boxed(response)
+    cleaned = clean_special_tokens(str(response or ""))
+    visible = visible_answer_after_think_tags(cleaned)
+    source = visible if visible.strip() else cleaned
+    ensured = ensure_boxed(source)
     boxed = _find_boxed_with_values(ensured)
     boxed_inners = [b[2].strip() for b in boxed]
     meta: dict = {
@@ -405,7 +444,10 @@ def canonicalize_free_response_with_meta(response: str) -> tuple[str, dict]:
             break
 
     meta["extractor_path"] = "free_cue_last" if meta["cue_matched"] else "free_last_boxed"
-    return f"\\boxed{{{selected_value}}}", meta
+    normalized = _normalize_free_inner(selected_value)
+    if normalized != selected_value:
+        meta["normalized_inner"] = True
+    return f"\\boxed{{{normalized}}}", meta
 
 
 def mcq_canonical_response(letter: str) -> str:

@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Phase 5: verify LoRA then private inference (uses best_adapter.txt when present).
+# Save holdout model outputs for error analysis / curation (Phase 3).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=env.sh
 source "${SCRIPT_DIR}/env.sh"
 
-GPU_ID="${GPU_ID:-0}"
 STAGE2_ROOT="${STAGE2_ROOT:-workspaces/stage2_adapt_v3}"
+GPU_ID="${GPU_ID:-0}"
 
 if [[ -f "$STAGE2_ROOT/best_adapter.txt" ]]; then
   ADAPTER="$(tr -d '\n' < "$STAGE2_ROOT/best_adapter.txt")"
@@ -15,26 +15,24 @@ else
   ADAPTER="$STAGE2_ROOT/final_adapter"
 fi
 
-if [[ ! -d "$ADAPTER" ]]; then
-  echo "Adapter not found: $ADAPTER"
-  echo "  Run: bash scripts/server/run_stage2_eval_and_pick.sh"
+HOLDOUT="$STAGE2_ROOT/stage2_holdout.jsonl"
+if [[ ! -f "$HOLDOUT" ]]; then
+  echo "Missing $HOLDOUT"
   exit 1
 fi
 
-echo "Using adapter: $ADAPTER"
-
-"$PY" scripts/modular_pipeline/verify_lora_vllm.py \
-  --lora-adapter-path "$ADAPTER" \
-  --gpu-id "$GPU_ID" \
-  --vllm-quantization none \
-  --vllm-load-format auto
-
 "$PY" scripts/modular_pipeline/modular_pipeline.py \
-  --input private \
+  --input "$HOLDOUT" \
   --lora-adapter-path "$ADAPTER" \
+  --output-dir results \
+  --no-eval \
   --gpu-id "$GPU_ID" \
   --vllm-quantization none \
   --vllm-load-format auto
 
-echo ""
-echo "Submit: results/private_submission.csv"
+# Rename to stable path for curate_data
+STEM="$(basename "$HOLDOUT" .jsonl)"
+if [[ -f "results/${STEM}_outputs.jsonl" ]]; then
+  cp "results/${STEM}_outputs.jsonl" results/holdout_outputs.jsonl
+  echo "Wrote results/holdout_outputs.jsonl"
+fi

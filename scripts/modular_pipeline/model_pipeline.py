@@ -7,6 +7,7 @@ safer MCQ extraction and stronger finalizer recovery.
 
 import os
 import re
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,8 @@ from settings import (
     POST_BOX_PATIENCE_TOKENS_FREE,
     POST_BOX_PATIENCE_TOKENS_MCQ,
     REP_PEN_FREE,
+    MCQ_SELF_CONSISTENCY_SAMPLES,
+    MCQ_SELF_CONSISTENCY_TEMP,
     REP_PEN_MCQ,
     REP_PEN_MCQ_FINAL,
     SYSTEM_PROMPT_FREE,
@@ -567,9 +570,80 @@ class ModularPipeline:
 
         return "", False, "mcq_abstain_no_signal", "none"
 
+    def _solve_mcq_batch_self_consistency(self, items: list[dict]) -> list[dict]:
+        """Majority vote over N sampled MCQ generations (Phase 4)."""
+        n_samples = max(1, int(MCQ_SELF_CONSISTENCY_SAMPLES))
+        user_prompts = [build_mcq_user(item["question"], item["options"]) for item in items]
+        system_prompts = [SYSTEM_PROMPT_MCQ] * len(items)
+        mcq_valid = [
+            {chr(65 + j) for j in range(len(item["options"]))}
+            for item in items
+        ]
+        vote_lists: list[list[str]] = [[] for _ in items]
+
+        for _ in range(n_samples):
+            outputs = self._generate_batch(
+                system_prompts,
+                user_prompts,
+                max_new_tokens=MAX_TOKENS_MCQ,
+                temperature=MCQ_SELF_CONSISTENCY_TEMP,
+                top_p=0.9,
+                top_k=20,
+                repetition_penalty=REP_PEN_MCQ,
+                do_sample=True,
+                think_budget=0,
+                enable_thinking=ENABLE_THINKING_MCQ_PRIMARY,
+                force_smart_boxed_stop=True,
+                mcq_valid_per_row=mcq_valid,
+                post_box_patience_tokens=POST_BOX_PATIENCE_TOKENS_MCQ,
+                no_repeat_ngram_size=NO_REPEAT_NGRAM_SIZE_MCQ,
+            )
+            for idx, (item, out) in enumerate(zip(items, outputs)):
+                labels = [chr(65 + i) for i in range(len(item["options"]))]
+                raw = out["raw"]
+                letter = _extract_last_valid_letter(raw, labels)
+                if not letter:
+                    letter = extract_valid_letter(
+                        visible_answer_after_think_tags(raw), labels
+                    )
+                if letter:
+                    vote_lists[idx].append(letter)
+
+        solved: list[dict] = []
+        for item, votes in zip(items, vote_lists):
+            if not votes:
+                solved.append(
+                    {
+                        "response": mcq_canonical_response(""),
+                        "raw": "",
+                        "meta": {
+                            "extractor_path": "mcq_self_consistency_abstain",
+                            "self_consistency_samples": n_samples,
+                        },
+                    }
+                )
+                continue
+            winner, _count = Counter(votes).most_common(1)[0]
+            response = mcq_canonical_response(winner)
+            solved.append(
+                {
+                    "response": response,
+                    "raw": response,
+                    "meta": {
+                        "extractor_path": "mcq_self_consistency_vote",
+                        "self_consistency_samples": n_samples,
+                        "vote_distribution": dict(Counter(votes)),
+                    },
+                }
+            )
+        return solved
+
     def solve_mcq_batch(self, items: list[dict]) -> list[dict]:
         if not items:
             return []
+
+        if MCQ_SELF_CONSISTENCY_SAMPLES and MCQ_SELF_CONSISTENCY_SAMPLES > 1:
+            return self._solve_mcq_batch_self_consistency(items)
 
         user_prompts = [build_mcq_user(item["question"], item["options"]) for item in items]
         system_prompts = [SYSTEM_PROMPT_MCQ] * len(items)
