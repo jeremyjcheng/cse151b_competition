@@ -12,6 +12,10 @@ LOG="logs/stage1_v2_$(date +%Y%m%d_%H%M).log"
 
 mkdir -p logs workspaces
 
+echo "Preflight: checking required packages in conda env..."
+bash "${SCRIPT_DIR}/test_installs.sh"
+echo ""
+
 HELP="$("$PY" scripts/modular_pipeline/train_lora.py --help 2>&1)" || true
 EXTRA=()
 if echo "$HELP" | grep -q 'load-in-4bit'; then EXTRA+=(--no-load-in-4bit); fi

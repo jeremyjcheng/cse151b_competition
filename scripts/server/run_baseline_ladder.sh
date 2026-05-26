@@ -29,7 +29,7 @@ _run_eval() {
   local cmd=(
     "$PY" scripts/modular_pipeline/eval_runner.py
     --input "$HOLDOUT"
-    --split-name "ladder_${label}"
+    --split-name "val"
     --eval-report "$report"
     "${VLLM_ARGS[@]}"
   )
