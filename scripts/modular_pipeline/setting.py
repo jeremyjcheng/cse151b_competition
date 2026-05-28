@@ -7,7 +7,7 @@ MODEL_ID = "Qwen/Qwen3-4B-Thinking-2507"
 # ============================================================
 
 VLLM_GPU_MEMORY_UTILIZATION = 0.75
-VLLM_MAX_MODEL_LEN = 8192
+VLLM_MAX_MODEL_LEN = 20480
 VLLM_MAX_NUM_SEQS = 4
 VLLM_MAX_NUM_BATCHED_TOKENS = 8192
 VLLM_QUANTIZATION = "bitsandbytes"
@@ -81,9 +81,22 @@ STAGE2_TRAIN_LIMIT_FREE = 25
 # MCQ generation settings
 # ============================================================
 
+# Optional base-only max-token boost. When enabled, doubles base generation
+# budgets while leaving LoRA-specific caps unchanged.
+MAX_BASE_ENABLED = True
+MAX_BASE_MULTIPLIER = 2
+
+# Keep explicit defaults so MAX_BASE can derive from known baselines.
+BASE_MAX_TOKENS_MCQ_DEFAULT = 6144
+BASE_MAX_TOKENS_FREE_DEFAULT = 8192
+
 # Match base-style budget so the model can derive before boxing the letter (low caps
 # caused shallow "the correct answer is ..." outputs on LoRA adapters).
-MAX_TOKENS_MCQ = 6144
+MAX_TOKENS_MCQ = (
+    BASE_MAX_TOKENS_MCQ_DEFAULT * MAX_BASE_MULTIPLIER
+    if MAX_BASE_ENABLED
+    else BASE_MAX_TOKENS_MCQ_DEFAULT
+)
 
 # Ignored by vLLM backend, kept for compatibility with older HF path.
 THINK_BUDGET_MCQ = 0
@@ -113,8 +126,6 @@ REP_PEN_MCQ_FINAL = 1.0
 
 # Ignore very early tentative \\boxed{letter} before enough reasoning tokens exist.
 MIN_TOKENS_BEFORE_BOXED_STOP = 128
-<<<<<<< HEAD
-=======
 
 # LoRA inference profile (base keeps MAX_TOKENS_MCQ/FREE above). Forcing min_tokens
 # on a FRQ-only Stage-1 adapter caused loops, many \\boxed{}, and hit max length.
@@ -131,7 +142,6 @@ LORA_STOP_AT_FIRST_CLEAN_BOXED = True
 LORA_REP_PEN_MCQ = 1.12
 LORA_REP_PEN_FREE = 1.15
 LORA_NO_REPEAT_NGRAM_SIZE_FREE = 12
->>>>>>> 376af72 (Retrying lora)
 
 POST_BOX_PATIENCE_TOKENS_FREE = 256
 POST_BOX_PATIENCE_TOKENS_MCQ = 0
@@ -154,7 +164,11 @@ NO_REPEAT_NGRAM_SIZE_FREE = 8
 # ============================================================
 
 # Align with high-token base runs; post-box patience + n-gram still limit runaway loops.
-MAX_TOKENS_FREE = 8192
+MAX_TOKENS_FREE = (
+    BASE_MAX_TOKENS_FREE_DEFAULT * MAX_BASE_MULTIPLIER
+    if MAX_BASE_ENABLED
+    else BASE_MAX_TOKENS_FREE_DEFAULT
+)
 
 # Ignored by vLLM backend, kept for compatibility with older HF path.
 THINK_BUDGET_FREE = 0
