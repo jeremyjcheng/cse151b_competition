@@ -382,6 +382,13 @@ def _resume_peft_adapter(base_model, adapter_path: str):
 
     adapter_path = str(Path(adapter_path).resolve())
     config = PeftConfig.from_pretrained(adapter_path)
+    # Some saved adapters set inference_mode=True, which freezes all LoRA params.
+    # Force trainable behavior when resuming.
+    if hasattr(config, "inference_mode"):
+        try:
+            config.inference_mode = False
+        except Exception:
+            pass
     model = get_peft_model(base_model, config)
     adapter_name = getattr(config, "adapter_name", None) or "default"
     if hasattr(model, "active_adapter") and model.active_adapter:
@@ -393,6 +400,20 @@ def _resume_peft_adapter(base_model, adapter_path: str):
     incompatible = set_peft_model_state_dict(model, weights, adapter_name=adapter_name)
     if incompatible:
         print(f"Note: {len(incompatible)} adapter keys not loaded (may be benign).")
+
+    # Ensure LoRA params are marked trainable (PEFT can keep them frozen depending on config).
+    try:
+        if hasattr(model, "set_adapter"):
+            model.set_adapter(adapter_name)
+    except Exception:
+        pass
+    trainable = 0
+    for name, p in model.named_parameters():
+        if "lora_" in name:
+            p.requires_grad = True
+            trainable += p.numel()
+    if trainable == 0:
+        print("Warning: no LoRA parameters were marked trainable after resume.")
 
     return model
 
