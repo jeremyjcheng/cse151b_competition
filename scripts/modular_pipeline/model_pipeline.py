@@ -27,6 +27,15 @@ from lora_vllm_utils import (
 )
 from prompting import build_free_user, build_mcq_user
 from settings import (
+    FREE_SELF_CONSISTENCY_ENABLED,
+    FREE_SELF_CONSISTENCY_N,
+    SC_SAMPLING_SEED,
+    SC_TEMP_FREE,
+    SC_TIEBREAK_ENABLED,
+    SC_TIEBREAK_SAMPLING_SEED,
+    SC_TIEBREAK_TEMP,
+    SC_TOP_K_FREE,
+    SC_TOP_P_FREE,
     ENABLE_THINKING_MCQ_PRIMARY,
     VLLM_ENFORCE_EAGER,
     FINAL_ANSWER_CUE_WINDOW_CHARS,
@@ -467,6 +476,7 @@ class ModularPipeline:
         top_k: int,
         repetition_penalty: float,
         do_sample: bool,
+        n: int = 1,
         no_repeat_ngram_size: int = 0,
         seed: int | None = None,
         min_tokens: int | None = None,
@@ -494,6 +504,7 @@ class ModularPipeline:
             min_p=0.0,
             presence_penalty=0.0,
             repetition_penalty=repetition_penalty,
+            n=max(1, int(n)),
         )
         if seed is not None:
             sampling_kwargs["seed"] = int(seed)
@@ -511,6 +522,179 @@ class ModularPipeline:
         except TypeError:
             sampling_kwargs.pop("no_repeat_ngram_size", None)
             return SamplingParams(**sampling_kwargs)
+
+    def _postprocess_free_completion(
+        self,
+        completion_text: str,
+        *,
+        max_new_tokens: int,
+        post_box_patience_tokens: int,
+        min_tokens_before_boxed_stop: int | None = None,
+    ) -> dict[str, Any]:
+        raw_before_trunc = clean_special_tokens(completion_text).strip()
+        raw_clean = self._truncate_for_smart_boxed_stop(
+            raw_clean=raw_before_trunc,
+            mcq_valid=None,
+            post_box_patience_tokens=post_box_patience_tokens,
+            min_tokens_before_boxed_stop=min_tokens_before_boxed_stop,
+        )
+        pre_trunc_tokens = len(self.tokenizer.encode(raw_before_trunc, add_special_tokens=False))
+        post_trunc_tokens = len(self.tokenizer.encode(raw_clean, add_special_tokens=False))
+        return {
+            "raw": raw_clean,
+            "raw_before_trunc": raw_before_trunc,
+            "n_tokens": int(post_trunc_tokens),
+            "pre_trunc_n_tokens": int(pre_trunc_tokens),
+            "generation_hit_max": bool(pre_trunc_tokens >= max_new_tokens),
+            "raw_was_post_truncated": raw_clean.strip() != raw_before_trunc.strip(),
+        }
+
+    def _generate_free_candidates(
+        self,
+        *,
+        system_prompts: list[str],
+        user_prompts: list[str],
+        n: int,
+        max_new_tokens: int,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+        repetition_penalty: float,
+        no_repeat_ngram_size: int,
+        sampling_seed: int | None,
+        min_new_tokens: int | None,
+        min_tokens_before_boxed_stop: int,
+        post_box_patience_tokens: int,
+        enable_thinking: bool = True,
+    ) -> list[list[dict[str, Any]]]:
+        """Generate `n` free-form candidates per prompt (vLLM only)."""
+        if self._peft_engine is not None:
+            raise RuntimeError("Free-form self-consistency is not supported for peft backend.")
+
+        chats = [
+            self._make_chat(system, user, enable_thinking=enable_thinking)
+            for system, user in zip(system_prompts, user_prompts)
+        ]
+        sampling_params = self._build_vllm_sampling_params(
+            max_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            repetition_penalty=repetition_penalty,
+            do_sample=True,
+            n=n,
+            no_repeat_ngram_size=no_repeat_ngram_size,
+            seed=sampling_seed,
+            min_tokens=min_new_tokens,
+        )
+
+        llm_kwargs: dict[str, Any] = {"sampling_params": sampling_params, "use_tqdm": False}
+        if self._lora_active and self._lora_request_obj is not None:
+            llm_kwargs["lora_request"] = self._lora_request_obj
+
+        request_outputs = self.llm.generate(chats, **llm_kwargs)
+        all_candidates: list[list[dict[str, Any]]] = []
+        for req_out in request_outputs:
+            per_prompt: list[dict[str, Any]] = []
+            for out in req_out.outputs:
+                per_prompt.append(
+                    self._postprocess_free_completion(
+                        out.text,
+                        max_new_tokens=max_new_tokens,
+                        post_box_patience_tokens=post_box_patience_tokens,
+                        min_tokens_before_boxed_stop=min_tokens_before_boxed_stop,
+                    )
+                )
+            if not per_prompt:
+                per_prompt.append(
+                    self._postprocess_free_completion(
+                        "",
+                        max_new_tokens=max_new_tokens,
+                        post_box_patience_tokens=post_box_patience_tokens,
+                        min_tokens_before_boxed_stop=min_tokens_before_boxed_stop,
+                    )
+                )
+            all_candidates.append(per_prompt)
+        return all_candidates
+
+    def _extract_sc_answer(self, raw_text: str, *, judger: Any) -> str:
+        pred = ""
+        if judger is not None:
+            try:
+                pred = str(judger.extract_ans(raw_text) or "").strip()
+            except Exception:
+                pred = ""
+        if not pred:
+            pred = str(extract_boxed(raw_text) or "").strip()
+        return pred
+
+    def _vote_self_consistency(
+        self,
+        candidates: list[dict[str, Any]],
+        *,
+        judger: Any,
+    ) -> tuple[int, dict[str, Any]]:
+        """Return chosen candidate index + vote metadata."""
+        candidate_answers = [
+            self._extract_sc_answer(str(c.get("raw") or ""), judger=judger)
+            for c in candidates
+        ]
+        first_non_empty_idx = next((i for i, ans in enumerate(candidate_answers) if ans), 0)
+
+        clusters: list[dict[str, Any]] = []
+        for idx, ans in enumerate(candidate_answers):
+            if not ans:
+                continue
+            ans_norm = ans.strip()
+            placed = False
+            for cluster in clusters:
+                same = ans_norm == cluster["rep_norm"]
+                if not same and judger is not None:
+                    try:
+                        same = bool(judger.is_equal(ans, cluster["rep"]))
+                    except Exception:
+                        same = False
+                if same:
+                    cluster["members"].append(idx)
+                    placed = True
+                    break
+            if not placed:
+                clusters.append({"rep": ans, "rep_norm": ans_norm, "members": [idx]})
+
+        max_size = max((len(c["members"]) for c in clusters), default=0)
+        no_consensus = max_size < 2
+        if no_consensus:
+            return first_non_empty_idx, {
+                "candidate_answers": candidate_answers,
+                "cluster_size": max_size,
+                "agreement": (float(max_size) / float(len(candidates))) if candidates else 0.0,
+                "no_consensus": True,
+                "first_non_empty_idx": first_non_empty_idx,
+            }
+
+        winning_clusters = [c for c in clusters if len(c["members"]) == max_size]
+        winning_clusters.sort(key=lambda c: min(c["members"]))
+        winning = winning_clusters[0]
+
+        winner_members = winning["members"]
+        one_box_members = [
+            idx for idx in winner_members if len(extract_all_boxed(str(candidates[idx].get("raw") or ""))) == 1
+        ]
+        representative_pool = one_box_members if one_box_members else winner_members
+        chosen_idx = min(
+            representative_pool,
+            key=lambda idx: (
+                int(candidates[idx].get("n_tokens") or 0),
+                idx,
+            ),
+        )
+        return chosen_idx, {
+            "candidate_answers": candidate_answers,
+            "cluster_size": max_size,
+            "agreement": (float(max_size) / float(len(candidates))) if candidates else 0.0,
+            "no_consensus": False,
+            "first_non_empty_idx": first_non_empty_idx,
+        }
 
     def _truncate_for_smart_boxed_stop(
         self,
@@ -1223,66 +1407,156 @@ class ModularPipeline:
             else NO_REPEAT_NGRAM_SIZE_FREE
         )
         rep_pen = LORA_REP_PEN_FREE if self._lora_active else REP_PEN_FREE
-        outputs = self._generate_batch(
-            system_prompts,
-            user_prompts,
-            max_new_tokens=free_max,
-            temperature=TEMP_FREE if temperature is None else float(temperature),
-            top_p=TOP_P_FREE if top_p is None else float(top_p),
-            top_k=TOP_K_FREE if top_k is None else int(top_k),
-            repetition_penalty=rep_pen,
-            do_sample=bool(do_sample),
-            think_budget=0,
-            force_smart_boxed_stop=True,
-            mcq_valid_per_row=None,
-            post_box_patience_tokens=post_patience,
-            no_repeat_ngram_size=ngram,
-            sampling_seed=sampling_seed,
-            min_new_tokens=lora_min_tokens,
-            min_tokens_before_boxed_stop=lora_min_before_box,
-        )
+        resolved_temp = TEMP_FREE if temperature is None else float(temperature)
+        resolved_top_p = TOP_P_FREE if top_p is None else float(top_p)
+        resolved_top_k = TOP_K_FREE if top_k is None else int(top_k)
 
-        solved: list[dict] = []
-
-        for item, out in zip(items, outputs):
+        def _build_free_record(
+            item: dict,
+            out: dict[str, Any],
+            *,
+            sc_meta: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
             raw = out["raw"]
             response, extract_meta = canonicalize_free_response_with_meta(
                 raw,
                 question=item.get("question"),
             )
             boxed_in_raw = extract_meta.get("boxed_candidates") or extract_all_boxed(raw)
+            meta: dict[str, Any] = {
+                "is_mcq": False,
+                "output_type": "free",
+                "model_id": self.model_id,
+                "lora_adapter_path": self.lora_adapter_path,
+                "raw": raw,
+                "n_tokens": out["n_tokens"],
+                "pre_trunc_n_tokens": out.get("pre_trunc_n_tokens"),
+                "generation_hit_max": out.get("generation_hit_max"),
+                "boxed": extract_boxed(response),
+                "cleaned_response": response,
+                "raw_was_truncated": response.strip() != raw.strip(),
+                "raw_was_post_truncated": out.get("raw_was_post_truncated", False),
+                "boxed_fallback_used": bool(extract_meta.get("fallback_used")),
+                "extractor_path": extract_meta.get("extractor_path", "free"),
+                "boxed_count_in_raw": extract_meta.get("boxed_count_in_raw", len(boxed_in_raw)),
+                "selected_boxed_index": extract_meta.get("selected_boxed_index"),
+                "expected_ans_slots": extract_meta.get("expected_ans_slots", 0),
+                "extracted_values": extract_meta.get("extracted_values", []),
+                "phrase_override": extract_meta.get("phrase_override", False),
+                "cue_matched": extract_meta.get("cue_matched", False),
+                "malformed_output": extract_meta.get("malformed_output", False),
+                "malformed_reason": extract_meta.get("malformed_reason", ""),
+                "training_echo_detected": _has_training_echo(raw),
+                "stop_policy": "smart_boxed_post",
+            }
+            if sc_meta:
+                meta.update(sc_meta)
+            return {"response": response, "raw": raw, "meta": meta}
 
-            solved.append(
-                {
-                    "response": response,
-                    "raw": raw,
-                    "meta": {
-                        "is_mcq": False,
-                        "output_type": "free",
-                        "model_id": self.model_id,
-                        "lora_adapter_path": self.lora_adapter_path,
-                        "raw": raw,
-                        "n_tokens": out["n_tokens"],
-                        "pre_trunc_n_tokens": out.get("pre_trunc_n_tokens"),
-                        "generation_hit_max": out.get("generation_hit_max"),
-                        "boxed": extract_boxed(response),
-                        "cleaned_response": response,
-                        "raw_was_truncated": response.strip() != raw.strip(),
-                        "raw_was_post_truncated": out.get("raw_was_post_truncated", False),
-                        "boxed_fallback_used": bool(extract_meta.get("fallback_used")),
-                        "extractor_path": extract_meta.get("extractor_path", "free"),
-                        "boxed_count_in_raw": extract_meta.get("boxed_count_in_raw", len(boxed_in_raw)),
-                        "selected_boxed_index": extract_meta.get("selected_boxed_index"),
-                        "expected_ans_slots": extract_meta.get("expected_ans_slots", 0),
-                        "extracted_values": extract_meta.get("extracted_values", []),
-                        "phrase_override": extract_meta.get("phrase_override", False),
-                        "cue_matched": extract_meta.get("cue_matched", False),
-                        "malformed_output": extract_meta.get("malformed_output", False),
-                        "malformed_reason": extract_meta.get("malformed_reason", ""),
-                        "training_echo_detected": _has_training_echo(raw),
-                        "stop_policy": "smart_boxed_post",
-                    },
-                }
+        use_sc = (
+            FREE_SELF_CONSISTENCY_ENABLED
+            and not self._lora_active
+            and self._peft_engine is None
+            and bool(do_sample)
+            and int(FREE_SELF_CONSISTENCY_N) > 1
+        )
+        if not use_sc:
+            outputs = self._generate_batch(
+                system_prompts,
+                user_prompts,
+                max_new_tokens=free_max,
+                temperature=resolved_temp,
+                top_p=resolved_top_p,
+                top_k=resolved_top_k,
+                repetition_penalty=rep_pen,
+                do_sample=bool(do_sample),
+                think_budget=0,
+                force_smart_boxed_stop=True,
+                mcq_valid_per_row=None,
+                post_box_patience_tokens=post_patience,
+                no_repeat_ngram_size=ngram,
+                sampling_seed=sampling_seed,
+                min_new_tokens=lora_min_tokens,
+                min_tokens_before_boxed_stop=lora_min_before_box,
             )
+            return [_build_free_record(item, out) for item, out in zip(items, outputs)]
 
+        sc_seed = SC_SAMPLING_SEED if sampling_seed is None else int(sampling_seed)
+        n_candidates = int(FREE_SELF_CONSISTENCY_N)
+        candidate_sets = self._generate_free_candidates(
+            system_prompts=system_prompts,
+            user_prompts=user_prompts,
+            n=n_candidates,
+            max_new_tokens=free_max,
+            temperature=SC_TEMP_FREE,
+            top_p=SC_TOP_P_FREE,
+            top_k=SC_TOP_K_FREE,
+            repetition_penalty=rep_pen,
+            no_repeat_ngram_size=ngram,
+            sampling_seed=sc_seed,
+            min_new_tokens=lora_min_tokens,
+            min_tokens_before_boxed_stop=lora_min_before_box,
+            post_box_patience_tokens=post_patience,
+        )
+
+        judger = self._get_judger()
+        chosen_indices: list[int] = []
+        vote_metas: list[dict[str, Any]] = []
+        unresolved_indices: list[int] = []
+        for idx, candidates in enumerate(candidate_sets):
+            chosen_idx, vote_meta = self._vote_self_consistency(candidates, judger=judger)
+            chosen_indices.append(chosen_idx)
+            vote_metas.append(vote_meta)
+            if bool(vote_meta.get("no_consensus")):
+                unresolved_indices.append(idx)
+
+        if unresolved_indices and SC_TIEBREAK_ENABLED:
+            tie_system = [system_prompts[i] for i in unresolved_indices]
+            tie_user = [user_prompts[i] for i in unresolved_indices]
+            tie_candidates = self._generate_free_candidates(
+                system_prompts=tie_system,
+                user_prompts=tie_user,
+                n=1,
+                max_new_tokens=free_max,
+                temperature=SC_TIEBREAK_TEMP,
+                top_p=resolved_top_p,
+                top_k=resolved_top_k,
+                repetition_penalty=rep_pen,
+                no_repeat_ngram_size=ngram,
+                sampling_seed=SC_TIEBREAK_SAMPLING_SEED,
+                min_new_tokens=lora_min_tokens,
+                min_tokens_before_boxed_stop=lora_min_before_box,
+                post_box_patience_tokens=post_patience,
+            )
+            for unresolved_pos, row_idx in enumerate(unresolved_indices):
+                if not tie_candidates[unresolved_pos]:
+                    continue
+                candidate_sets[row_idx].append(tie_candidates[unresolved_pos][0])
+                chosen_idx, vote_meta = self._vote_self_consistency(
+                    candidate_sets[row_idx],
+                    judger=judger,
+                )
+                if bool(vote_meta.get("no_consensus")):
+                    tie_answer = vote_meta.get("candidate_answers", [""])[-1]
+                    chosen_idx = (
+                        len(candidate_sets[row_idx]) - 1
+                        if str(tie_answer).strip()
+                        else int(vote_meta.get("first_non_empty_idx", chosen_idx))
+                    )
+                chosen_indices[row_idx] = chosen_idx
+                vote_meta["tiebreak_used"] = True
+                vote_metas[row_idx] = vote_meta
+
+        solved: list[dict] = []
+        for item, candidates, chosen_idx, vote_meta in zip(items, candidate_sets, chosen_indices, vote_metas):
+            out = candidates[chosen_idx]
+            sc_meta = {
+                "self_consistency_n": len(candidates),
+                "sc_cluster_size": int(vote_meta.get("cluster_size", 0)),
+                "sc_agreement": float(vote_meta.get("agreement", 0.0)),
+                "sc_candidate_answers": vote_meta.get("candidate_answers", []),
+                "sc_no_consensus": bool(vote_meta.get("no_consensus", False)),
+                "sc_tiebreak_used": bool(vote_meta.get("tiebreak_used", False)),
+            }
+            solved.append(_build_free_record(item, out, sc_meta=sc_meta))
         return solved

@@ -179,6 +179,19 @@ TOP_P_FREE = 0.9
 TOP_K_FREE = 10
 REP_PEN_FREE = 1.10
 
+# Free-form self-consistency (base model only; MCQ unaffected).
+FREE_SELF_CONSISTENCY_ENABLED = True
+FREE_SELF_CONSISTENCY_N = 3
+SC_TEMP_FREE = 0.7
+SC_TOP_P_FREE = 0.95
+SC_TOP_K_FREE = 20
+SC_SAMPLING_SEED = 1234
+
+# No-consensus tiebreak: add one low-temperature sample only when all SC samples disagree.
+SC_TIEBREAK_ENABLED = True
+SC_TIEBREAK_TEMP = 0.1
+SC_TIEBREAK_SAMPLING_SEED = 4321
+
 
 # ============================================================
 # Batch sizes
