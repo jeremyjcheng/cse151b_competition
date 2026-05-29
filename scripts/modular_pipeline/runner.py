@@ -96,38 +96,29 @@ def _format_private_submission2_response(rec: dict) -> str:
     return raw_trace
 
 
-def _sort_and_verify_private_full_trace_csv(
+def _build_private_submission_rows(
+    data: list[dict],
+    records_by_id: dict,
+) -> list[dict[str, str]]:
+    """Build submission2-style rows from solved private records."""
+    return [
+        {
+            "id": str(item.get("id")),
+            "response": _format_private_submission2_response(records_by_id[item.get("id")]),
+        }
+        for item in data
+    ]
+
+
+def _verify_private_submission_rows(
+    rows: list[dict[str, str]],
     *,
-    input_path: Path,
-    output_path: Path,
+    expected_ids: set[int],
 ) -> None:
-    """Sort private full-trace CSV by integer id and verify strict constraints."""
-    with open(input_path, "r", encoding="utf-8", newline="") as f:
-        reader = csv.DictReader(f)
-        rows = list(reader)
-        header = reader.fieldnames or []
-
-    rows.sort(key=lambda r: int(r["id"]))
-
-    with open(output_path, "w", encoding="utf-8", newline="") as out:
-        writer = csv.DictWriter(
-            out,
-            fieldnames=["id", "response"],
-            quoting=csv.QUOTE_MINIMAL,
-        )
-        writer.writeheader()
-        writer.writerows(rows)
-
-    print(f"Wrote sorted full-trace submission to {output_path.resolve()}")
-
-    with open(output_path, "r", encoding="utf-8", newline="") as f:
-        reader = csv.DictReader(f)
-        rows = list(reader)
-        header = reader.fieldnames or []
-
+    """Verify private submission rows before/after writing CSV."""
     ids = [int(r["id"]) for r in rows]
     id_set = set(ids)
-    missing_ids = sorted(set(range(943)) - id_set)
+    missing_ids = sorted(expected_ids - id_set)
     duplicate_count = len(ids) - len(id_set)
     empty_responses = sum(1 for r in rows if not str(r.get("response", "")).strip())
     responses_with_boxed = sum(1 for r in rows if "\\boxed" in str(r.get("response", "")))
@@ -135,8 +126,9 @@ def _sort_and_verify_private_full_trace_csv(
     min_id = min(ids) if ids else None
     max_id = max(ids) if ids else None
 
-    print("Header:", header)
+    print("Header:", ["id", "response"])
     print("Rows:", len(rows))
+    print("Expected rows:", len(expected_ids))
     print("Min id:", min_id)
     print("Max id:", max_id)
     print("Duplicate IDs:", duplicate_count)
@@ -146,14 +138,10 @@ def _sort_and_verify_private_full_trace_csv(
     print("Sorted by ID:", is_sorted)
 
     errors: list[str] = []
-    if header != ["id", "response"]:
-        errors.append(f"header mismatch: {header}")
-    if len(rows) != 943:
-        errors.append(f"row count mismatch: {len(rows)} != 943")
-    if min_id != 0:
-        errors.append(f"min id mismatch: {min_id} != 0")
-    if max_id != 942:
-        errors.append(f"max id mismatch: {max_id} != 942")
+    if len(rows) != len(expected_ids):
+        errors.append(f"row count mismatch: {len(rows)} != {len(expected_ids)}")
+    if id_set != expected_ids:
+        errors.append("id set mismatch vs input questions")
     if duplicate_count != 0:
         errors.append(f"duplicate ids found: {duplicate_count}")
     if missing_ids:
@@ -177,6 +165,30 @@ def _sort_and_verify_private_full_trace_csv(
 
     if errors:
         raise SystemExit("Private full-trace submission verification failed: " + "; ".join(errors))
+
+
+def _write_private_submission_sorted_csv(
+    *,
+    output_path: Path,
+    data: list[dict],
+    records_by_id: dict,
+) -> None:
+    """Write the only private submission CSV: sorted, verified, submission2 format."""
+    rows = _build_private_submission_rows(data, records_by_id)
+    rows.sort(key=lambda r: int(r["id"]))
+    expected_ids = {int(item.get("id")) for item in data}
+
+    with open(output_path, "w", encoding="utf-8", newline="") as out:
+        writer = csv.DictWriter(
+            out,
+            fieldnames=["id", "response"],
+            quoting=csv.QUOTE_MINIMAL,
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"Wrote private submission to {output_path.resolve()}")
+    _verify_private_submission_rows(rows, expected_ids=expected_ids)
 
 
 def main() -> None:
@@ -277,54 +289,40 @@ def main() -> None:
     print(f"Saved ordered outputs to {ordered_output_path.resolve()}")
 
     is_private_input = input_path.stem == "private"
-    with open(submission_path, "w", newline="") as f:
-        writer = csv.writer(f, quoting=csv.QUOTE_MINIMAL)
-        writer.writerow(["id", "response"])
-        short_trace_count = 0
-        for item in data:
-            rec = records_by_id[item.get("id")]
-            if is_private_input:
-                response = _format_private_submission2_response(rec)
-                writer.writerow([rec["id"], response])
-                continue
-
-            if args.submission_full_trace:
-                meta = rec.get("meta") or {}
-                trace = rec.get("raw") or meta.get("raw") or rec.get("response", "")
-                n_tok = meta.get("n_tokens") or meta.get("total_n_tokens")
-                if isinstance(n_tok, (int, float)) and n_tok < 32:
-                    short_trace_count += 1
-            else:
-                trace = rec.get("response", "")
-            response = str(trace).replace("\r\n", "\n").replace("\r", "\n")
-            writer.writerow([rec["id"], response])
-        if args.submission_full_trace:
-            print(
-                "Submission CSV uses full model traces (--submission-full-trace)."
-            )
-            if short_trace_count:
-                print(
-                    f"Warning: {short_trace_count} rows have very short traces (<32 tokens). "
-                    "MCQ-only LoRA often emits only \\boxed{{X}}; use base or Stage-1 LoRA "
-                    "for competition-style reasoning traces."
-                )
-    print(f"Saved submission CSV to {submission_path.resolve()}")
-
     if is_private_input:
-        fixed_submission_path = output_dir / "private_submission_full_trace_fixed.csv"
-        sorted_submission_path = output_dir / "private_submission_full_trace_sorted.csv"
-        with open(fixed_submission_path, "w", encoding="utf-8", newline="") as out:
-            writer = csv.writer(out, quoting=csv.QUOTE_MINIMAL)
+        _write_private_submission_sorted_csv(
+            output_path=submission_path,
+            data=data,
+            records_by_id=records_by_id,
+        )
+    else:
+        with open(submission_path, "w", newline="") as f:
+            writer = csv.writer(f, quoting=csv.QUOTE_MINIMAL)
             writer.writerow(["id", "response"])
+            short_trace_count = 0
             for item in data:
                 rec = records_by_id[item.get("id")]
-                response = _format_private_submission2_response(rec)
+                if args.submission_full_trace:
+                    meta = rec.get("meta") or {}
+                    trace = rec.get("raw") or meta.get("raw") or rec.get("response", "")
+                    n_tok = meta.get("n_tokens") or meta.get("total_n_tokens")
+                    if isinstance(n_tok, (int, float)) and n_tok < 32:
+                        short_trace_count += 1
+                else:
+                    trace = rec.get("response", "")
+                response = str(trace).replace("\r\n", "\n").replace("\r", "\n")
                 writer.writerow([rec["id"], response])
-        print(f"Saved fixed full-trace CSV to {fixed_submission_path.resolve()}")
-        _sort_and_verify_private_full_trace_csv(
-            input_path=fixed_submission_path,
-            output_path=sorted_submission_path,
-        )
+            if args.submission_full_trace:
+                print(
+                    "Submission CSV uses full model traces (--submission-full-trace)."
+                )
+                if short_trace_count:
+                    print(
+                        f"Warning: {short_trace_count} rows have very short traces (<32 tokens). "
+                        "MCQ-only LoRA often emits only \\boxed{{X}}; use base or Stage-1 LoRA "
+                        "for competition-style reasoning traces."
+                    )
+        print(f"Saved submission CSV to {submission_path.resolve()}")
 
     if has_answers and not args.no_eval:
         evaluate_with_judger(data, records_by_id)
