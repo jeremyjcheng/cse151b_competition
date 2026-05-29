@@ -77,6 +77,25 @@ def _load_records_by_id(output_path: Path) -> dict:
     return records_by_id
 
 
+def _format_private_submission2_response(rec: dict) -> str:
+    """Build submission2-style response from a private inference record."""
+    meta = rec.get("meta") or {}
+    raw_trace = str(rec.get("raw") or meta.get("raw") or "")
+    canonical_response = str(rec.get("response") or "")
+
+    raw_trace = raw_trace.replace("\r\n", "\n").replace("\r", "\n")
+    canonical_response = canonical_response.replace("\r\n", "\n").replace("\r", "\n")
+
+    if "\\boxed" in raw_trace:
+        return raw_trace
+
+    if raw_trace.strip() and canonical_response.strip():
+        return f"{raw_trace}\n\nFinal answer: {canonical_response}"
+    if canonical_response.strip():
+        return canonical_response
+    return raw_trace
+
+
 def _sort_and_verify_private_full_trace_csv(
     *,
     input_path: Path,
@@ -257,12 +276,18 @@ def main() -> None:
             f.write(json.dumps(rec) + "\n")
     print(f"Saved ordered outputs to {ordered_output_path.resolve()}")
 
+    is_private_input = input_path.stem == "private"
     with open(submission_path, "w", newline="") as f:
         writer = csv.writer(f, quoting=csv.QUOTE_MINIMAL)
         writer.writerow(["id", "response"])
         short_trace_count = 0
         for item in data:
             rec = records_by_id[item.get("id")]
+            if is_private_input:
+                response = _format_private_submission2_response(rec)
+                writer.writerow([rec["id"], response])
+                continue
+
             if args.submission_full_trace:
                 meta = rec.get("meta") or {}
                 trace = rec.get("raw") or meta.get("raw") or rec.get("response", "")
@@ -285,7 +310,7 @@ def main() -> None:
                 )
     print(f"Saved submission CSV to {submission_path.resolve()}")
 
-    if args.submission_full_trace and input_path.stem == "private":
+    if is_private_input:
         fixed_submission_path = output_dir / "private_submission_full_trace_fixed.csv"
         sorted_submission_path = output_dir / "private_submission_full_trace_sorted.csv"
         with open(fixed_submission_path, "w", encoding="utf-8", newline="") as out:
@@ -293,9 +318,7 @@ def main() -> None:
             writer.writerow(["id", "response"])
             for item in data:
                 rec = records_by_id[item.get("id")]
-                meta = rec.get("meta") or {}
-                trace = rec.get("raw") or meta.get("raw") or rec.get("response", "")
-                response = str(trace).replace("\r\n", "\n").replace("\r", "\n")
+                response = _format_private_submission2_response(rec)
                 writer.writerow([rec["id"], response])
         print(f"Saved fixed full-trace CSV to {fixed_submission_path.resolve()}")
         _sort_and_verify_private_full_trace_csv(
