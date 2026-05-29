@@ -1,0 +1,826 @@
+"""CLI parsing and run configuration helpers."""
+
+import argparse
+import json
+from pathlib import Path
+
+from settings import (
+    GRAD_ACCUM_STEPS,
+    LEARNING_RATE,
+    LORA_ALPHA,
+    LORA_DROPOUT,
+    LORA_R,
+    LORA_TARGET_MODULES,
+    MAX_TOKENS_FREE,
+    MAX_TOKENS_MCQ,
+    MAX_TOKENS_MCQ_FINAL,
+    MAX_SEQ_LEN,
+    MAX_STEPS,
+    SAVE_EVERY_STEPS,
+    TRAIN_BATCH_SIZE,
+    WARMUP_RATIO,
+    WEIGHT_DECAY,
+)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Modular batched inference for Qwen3-4B-Thinking.",
+    )
+    parser.add_argument(
+        "--input",
+        default="private",
+        help=(
+            "'private' (default), 'public', or a path to a .jsonl file. "
+            "'private' targets the leaderboard test set; 'public' enables "
+            "judger-based local accuracy reporting."
+        ),
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Directory for output files. Default: <project root>/results",
+    )
+    parser.add_argument(
+        "--no-eval",
+        action="store_true",
+        help="Skip judger evaluation even if the input has 'answer' fields.",
+    )
+    parser.add_argument(
+        "--gpu-id",
+        default="0",
+        help="CUDA_VISIBLE_DEVICES value passed through to the pipeline.",
+    )
+    parser.add_argument(
+        "--lora-adapter-path",
+        default=None,
+        help=(
+            "Optional local path to a trained LoRA adapter directory. "
+            "If provided, adapter weights are loaded via vLLM LoRA (enable_lora + LoRARequest)."
+        ),
+    )
+    parser.add_argument(
+        "--vllm-quantization",
+        default=None,
+        help=(
+            "Override vLLM quantization (default from settings: bitsandbytes). "
+            "Use 'none' to disable quantization for LoRA debugging."
+        ),
+    )
+    parser.add_argument(
+        "--vllm-load-format",
+        default=None,
+        help=(
+            "Override vLLM load_format (default from settings: bitsandbytes). "
+            "Use 'auto' with --vllm-quantization none for full-precision LoRA experiments."
+        ),
+    )
+    parser.add_argument(
+        "--no-bitsandbytes",
+        action="store_true",
+        help=(
+            "Disable vLLM bitsandbytes quantization (sets quantization=none, "
+            "load_format=auto). Use when LoRA + bitsandbytes hangs on first generate."
+        ),
+    )
+    parser.add_argument(
+        "--dtype",
+        choices=("bfloat16", "float16"),
+        default=None,
+        help=(
+            "Load base weights in full precision (implies --no-bitsandbytes). "
+            "Use bfloat16 for LoRA debugging on Ampere+ GPUs."
+        ),
+    )
+    parser.add_argument(
+        "--vllm-enforce-eager",
+        action="store_true",
+        help=(
+            "Set vLLM enforce_eager=True (skip CUDA graphs; can avoid hangs during "
+            "first LoRA generate / torch.compile)."
+        ),
+    )
+    parser.add_argument(
+        "--inference-backend",
+        choices=("vllm", "peft"),
+        default="vllm",
+        help=(
+            "Inference engine. Default vllm. Use peft for Transformers+PEFT LoRA "
+            "when vLLM LoRA is unstable (requires --lora-adapter-path)."
+        ),
+    )
+    parser.add_argument(
+        "--limit-mcq",
+        type=int,
+        default=None,
+        help=(
+            "Cap the number of MCQ items processed (random subset, fixed by "
+            "--sample-seed). Default: no cap."
+        ),
+    )
+    parser.add_argument(
+        "--limit-free",
+        type=int,
+        default=None,
+        help=(
+            "Cap the number of free-form items processed (random subset, fixed "
+            "by --sample-seed). Default: no cap."
+        ),
+    )
+    parser.add_argument(
+        "--sample-seed",
+        type=int,
+        default=0,
+        help="Seed for the random subset selection used by --limit-mcq / --limit-free.",
+    )
+    parser.add_argument(
+        "--save-raw-output",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "If enabled (default), persist full raw model generations in JSONL "
+            "outputs under the `raw` field. Disable with --no-save-raw-output."
+        ),
+    )
+    parser.add_argument(
+        "--submission-full-trace",
+        action="store_true",
+        help=(
+            "Write the competition CSV `response` column from the full model trace "
+            "(JSONL `raw` field), including chain-of-thought and a final \\boxed{...}. "
+            "Default CSV uses canonicalized MCQ letters only."
+        ),
+    )
+    parser.add_argument(
+        "--mcq-max-new-tokens",
+        type=int,
+        default=MAX_TOKENS_MCQ,
+        help=f"Max new tokens for MCQ primary generation. Default: {MAX_TOKENS_MCQ}.",
+    )
+    parser.add_argument(
+        "--mcq-final-max-new-tokens",
+        type=int,
+        default=MAX_TOKENS_MCQ_FINAL,
+        help=(
+            "Max new tokens for MCQ finalizer generation. "
+            f"Default: {MAX_TOKENS_MCQ_FINAL}."
+        ),
+    )
+    parser.add_argument(
+        "--free-max-new-tokens",
+        type=int,
+        default=MAX_TOKENS_FREE,
+        help=f"Max new tokens for free-form generation. Default: {MAX_TOKENS_FREE}.",
+    )
+    args = parser.parse_args()
+    return apply_vllm_cli_overrides(args)
+
+
+def apply_vllm_cli_overrides(args: argparse.Namespace) -> argparse.Namespace:
+    """Apply convenience flags that override vLLM quantization/load_format."""
+    if getattr(args, "no_bitsandbytes", False) or getattr(args, "dtype", None):
+        args.vllm_quantization = "none"
+        args.vllm_load_format = "auto"
+        label = "no-bitsandbytes" if args.no_bitsandbytes else f"dtype={args.dtype}"
+        print(f"vLLM: using full-precision load ({label})")
+    return args
+
+
+def parse_train_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="LoRA fine-tuning with a custom PyTorch loop.",
+    )
+    parser.add_argument(
+        "--stage",
+        choices=("reasoning", "adapt", "mcq", "mixed_reasoning_mcq", "rejection_sft"),
+        default="adapt",
+        help=(
+            "Training stage. `reasoning` trains on public reasoning datasets; "
+            "`adapt` lightly adapts formatting on competition data; "
+            "`mcq` trains MCQ-focused adapter data; "
+            "`mixed_reasoning_mcq` mixes FRQ reasoning + MCQ data; "
+            "`rejection_sft` trains only on accepted rejection replay traces."
+        ),
+    )
+    parser.add_argument(
+        "--train-preset",
+        choices=("none", "fast_pilot", "one_day_full"),
+        default="none",
+        help=(
+            "Optional training preset for compute-constrained CoT runs. "
+            "`fast_pilot` targets a short smoke run; `one_day_full` targets ~1 day on 1 GPU."
+        ),
+    )
+    parser.add_argument(
+        "--input",
+        default="public",
+        help=(
+            "'public' (default), 'private', or a path to a .jsonl file with "
+            "optional `answer` fields used as supervision targets."
+        ),
+    )
+    parser.add_argument(
+        "--output-dir",
+        required=True,
+        help="Directory where LoRA adapter checkpoints and final adapter are saved.",
+    )
+    parser.add_argument(
+        "--gpu-id",
+        default="0",
+        help="CUDA_VISIBLE_DEVICES value passed through to training.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=TRAIN_BATCH_SIZE,
+        help=f"Per-step micro-batch size. Default: {TRAIN_BATCH_SIZE}.",
+    )
+    parser.add_argument(
+        "--grad-accum-steps",
+        type=int,
+        default=GRAD_ACCUM_STEPS,
+        help=f"Gradient accumulation steps. Default: {GRAD_ACCUM_STEPS}.",
+    )
+    parser.add_argument(
+        "--learning-rate",
+        type=float,
+        default=LEARNING_RATE,
+        help=f"Optimizer learning rate. Default: {LEARNING_RATE}.",
+    )
+    parser.add_argument(
+        "--weight-decay",
+        type=float,
+        default=WEIGHT_DECAY,
+        help=f"Optimizer weight decay. Default: {WEIGHT_DECAY}.",
+    )
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=MAX_STEPS,
+        help=f"Maximum optimizer steps. Default: {MAX_STEPS}.",
+    )
+    parser.add_argument(
+        "--warmup-ratio",
+        type=float,
+        default=WARMUP_RATIO,
+        help=f"Warmup ratio for scheduler. Default: {WARMUP_RATIO}.",
+    )
+    parser.add_argument(
+        "--max-seq-length",
+        "--max-seq-len",
+        dest="max_seq_len",
+        type=int,
+        default=MAX_SEQ_LEN,
+        help=f"Training sequence length cap. Default: {MAX_SEQ_LEN}.",
+    )
+    parser.add_argument(
+        "--save-every-steps",
+        type=int,
+        default=SAVE_EVERY_STEPS,
+        help=f"Checkpoint save interval. Default: {SAVE_EVERY_STEPS}.",
+    )
+    parser.add_argument(
+        "--lora-r",
+        type=int,
+        default=LORA_R,
+        help=f"LoRA rank. Default: {LORA_R}.",
+    )
+    parser.add_argument(
+        "--lora-alpha",
+        type=int,
+        default=LORA_ALPHA,
+        help=f"LoRA alpha. Default: {LORA_ALPHA}.",
+    )
+    parser.add_argument(
+        "--lora-dropout",
+        type=float,
+        default=LORA_DROPOUT,
+        help=f"LoRA dropout. Default: {LORA_DROPOUT}.",
+    )
+    parser.add_argument(
+        "--lora-target-modules",
+        nargs="+",
+        default=list(LORA_TARGET_MODULES),
+        help=(
+            "One or more module names to target with LoRA adapters. "
+            f"Default: {' '.join(LORA_TARGET_MODULES)}"
+        ),
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Random seed for data order and reproducibility.",
+    )
+    parser.add_argument(
+        "--limit-mcq",
+        type=int,
+        default=None,
+        help="Optional cap for MCQ examples during training.",
+    )
+    parser.add_argument(
+        "--limit-free",
+        type=int,
+        default=None,
+        help="Optional cap for free-form examples during training.",
+    )
+    parser.add_argument(
+        "--sample-seed",
+        type=int,
+        default=0,
+        help="Seed for subset selection when limits are enabled.",
+    )
+    parser.add_argument(
+        "--include-metamathqa",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Include meta-math/MetaMathQA in reasoning-capable stages (recommended).",
+    )
+    parser.add_argument(
+        "--include-numinamath-cot",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Include AI-MO/NuminaMath-CoT in reasoning-capable stages (recommended).",
+    )
+    parser.add_argument(
+        "--max-metamathqa-examples",
+        type=int,
+        default=None,
+        help="Optional cap for MetaMathQA examples in reasoning-capable stages.",
+    )
+    parser.add_argument(
+        "--max-numinamath-cot-examples",
+        type=int,
+        default=None,
+        help="Optional cap for NuminaMath-CoT examples in reasoning-capable stages.",
+    )
+    parser.add_argument(
+        "--include-openmath",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Include unsloth/OpenMathReasoning-mini in stage `reasoning` "
+            "(opt-in)."
+        ),
+    )
+    parser.add_argument(
+        "--include-hendrycks",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Include EleutherAI/hendrycks_math in stage `reasoning` (opt-in).",
+    )
+    parser.add_argument(
+        "--max-openmath-examples",
+        type=int,
+        default=None,
+        help="Optional cap for OpenMath examples in stage `reasoning`.",
+    )
+    parser.add_argument(
+        "--max-hendrycks-examples",
+        type=int,
+        default=None,
+        help="Optional cap for Hendrycks examples in stage `reasoning`.",
+    )
+    parser.add_argument(
+        "--include-orca-math",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Include microsoft/orca-math-word-problems-200k in reasoning-capable stages.",
+    )
+    parser.add_argument(
+        "--max-orca-math-examples",
+        type=int,
+        default=None,
+        help="Optional cap for Orca-Math examples.",
+    )
+    parser.add_argument(
+        "--include-ultrainteract-math",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Include openbmb/UltraInteract_sft filtered to task in {Math_Cot, Math_PoT} "
+            "and tool-safe rows."
+        ),
+    )
+    parser.add_argument(
+        "--max-ultrainteract-math-examples",
+        type=int,
+        default=None,
+        help="Optional cap for UltraInteract math-only examples.",
+    )
+    parser.add_argument(
+        "--include-math-mc",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Include XiangPan/math-mc in MCQ-capable stages (opt-in).",
+    )
+    parser.add_argument(
+        "--include-compmath-mcq",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Include biancaraimondi/CompMath-MCQ in MCQ-capable stages (opt-in).",
+    )
+    parser.add_argument(
+        "--max-math-mc-examples",
+        type=int,
+        default=None,
+        help="Optional cap for math-mc examples.",
+    )
+    parser.add_argument(
+        "--max-compmath-mcq-examples",
+        type=int,
+        default=None,
+        help="Optional cap for CompMath-MCQ examples.",
+    )
+    parser.add_argument(
+        "--mcq-example-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "Relative weight for MCQ examples in mixed training. "
+            "1.0 keeps natural counts; >1 upsamples MCQ; <1 downsamples MCQ."
+        ),
+    )
+    parser.add_argument(
+        "--metamathqa-weight",
+        type=float,
+        default=1.0,
+        help="Relative weight for MetaMathQA examples in mixed training.",
+    )
+    parser.add_argument(
+        "--numinamath-cot-weight",
+        type=float,
+        default=1.0,
+        help="Relative weight for NuminaMath-CoT examples in mixed training.",
+    )
+    parser.add_argument(
+        "--openmath-weight",
+        type=float,
+        default=1.0,
+        help="Relative weight for OpenMathReasoning examples in mixed training.",
+    )
+    parser.add_argument(
+        "--hendrycks-weight",
+        type=float,
+        default=1.0,
+        help="Relative weight for Hendrycks examples in mixed training.",
+    )
+    parser.add_argument(
+        "--orca-math-weight",
+        type=float,
+        default=1.0,
+        help="Relative weight for Orca-Math examples in mixed training.",
+    )
+    parser.add_argument(
+        "--ultrainteract-math-weight",
+        type=float,
+        default=1.0,
+        help="Relative weight for UltraInteract Math_Cot/Math_PoT examples in mixed training.",
+    )
+    parser.add_argument(
+        "--math-mc-weight",
+        type=float,
+        default=1.0,
+        help="Relative weight for math-mc examples in mixed training.",
+    )
+    parser.add_argument(
+        "--compmath-mcq-weight",
+        type=float,
+        default=1.0,
+        help="Relative weight for CompMath-MCQ examples in mixed training.",
+    )
+    parser.add_argument(
+        "--base-replay-weight",
+        type=float,
+        default=1.0,
+        help="Relative weight for base replay examples in mixed training.",
+    )
+    parser.add_argument(
+        "--mcq-target-mode",
+        choices=("letter_only", "full_trace"),
+        default="letter_only",
+        help=(
+            "MCQ supervision shape. `letter_only` trains on \\boxed{letter} only (fast, no CoT). "
+            "`full_trace` trains on reasoning text ending in \\boxed{letter}: base-replay uses "
+            "JSONL `raw` traces; hub MCQ sets use a short rationale stub (no real CoT in those datasets)."
+        ),
+    )
+    parser.add_argument(
+        "--mcq-bridge-short",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable short MCQ bridge defaults: prioritize MCQ + accepted replay with "
+            "conservative step budget for one-day runs."
+        ),
+    )
+    parser.add_argument(
+        "--mcq-replay-min-tokens",
+        type=int,
+        default=32,
+        help=(
+            "With --mcq-target-mode full_trace, skip base-replay rows whose meta n_tokens is below this."
+        ),
+    )
+    parser.add_argument(
+        "--print-dataset-samples",
+        action="store_true",
+        help="Print 3-5 formatted samples from each enabled dataset before training.",
+    )
+    parser.add_argument(
+        "--include-base-replay",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Include base replay examples from a prior output JSONL.",
+    )
+    parser.add_argument(
+        "--base-replay-path",
+        default=None,
+        help="Path to base model output JSONL used for replay filtering.",
+    )
+    parser.add_argument(
+        "--max-base-replay-examples",
+        type=int,
+        default=None,
+        help="Optional cap for accepted base replay examples.",
+    )
+    parser.add_argument(
+        "--include-rejection-replay",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Include high-quality rejection-sampled replay examples from JSONL.",
+    )
+    parser.add_argument(
+        "--rejection-replay-path",
+        default=None,
+        help="Path to rejection replay JSONL built from judged correct traces.",
+    )
+    parser.add_argument(
+        "--max-rejection-replay-examples",
+        type=int,
+        default=None,
+        help="Optional cap for accepted rejection replay examples.",
+    )
+    parser.add_argument(
+        "--rejection-replay-weight",
+        type=float,
+        default=1.0,
+        help=(
+            "Relative weight for rejection replay examples. "
+            "1.0 keeps natural counts; >1 upsamples; <1 downsamples."
+        ),
+    )
+    parser.add_argument(
+        "--hendrycks-configs",
+        nargs="+",
+        default=[
+            "algebra",
+            "counting_and_probability",
+            "geometry",
+            "intermediate_algebra",
+            "number_theory",
+            "prealgebra",
+            "precalculus",
+        ],
+        help=(
+            "Hendrycks subject configs to load when --include-hendrycks is set."
+        ),
+    )
+    parser.add_argument(
+        "--train-on-full-chat",
+        "--stage2-train-on-full-chat",
+        dest="train_on_full_chat",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "If enabled, train on all assistant tokens in the completion. "
+            "Keep disabled for conservative Stage-2 adaptation to avoid style copying."
+        ),
+    )
+    parser.add_argument(
+        "--stage2-final-answer-only",
+        dest="stage2_final_answer_only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Stage-2 only: supervise final boxed answers instead of long reasoning traces. "
+            "Recommended to reduce overfitting to public labels."
+        ),
+    )
+    parser.add_argument(
+        "--stage2-freeze-reasoning-style",
+        dest="stage2_freeze_reasoning_style",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Stage-2 only: keep adaptation focused on answer format and avoid re-teaching "
+            "reasoning style from small public data."
+        ),
+    )
+    parser.add_argument(
+        "--stage2-holdout-fraction",
+        type=float,
+        default=None,
+        help=(
+            "Stage-2 only: fraction of supervised public items reserved for eval (not trained on). "
+            "Use this so local public scoring reflects generalization, not memorization."
+        ),
+    )
+    parser.add_argument(
+        "--stage2-holdout-seed",
+        type=int,
+        default=0,
+        help="Seed for Stage-2 train/holdout split.",
+    )
+    parser.add_argument(
+        "--resume-from-adapter",
+        default=None,
+        help=(
+            "Optional adapter directory to resume from before current stage "
+            "training (typically Stage 2 adaption from Stage 1 adapter)."
+        ),
+    )
+    parser.add_argument(
+        "--save-final-merged",
+        action="store_true",
+        help="If set, also save a merged full model checkpoint (large).",
+    )
+    parser.add_argument(
+        "--target-module-set",
+        choices=("full", "attention"),
+        default=None,
+        help=(
+            "Convenience preset for --lora-target-modules. "
+            "'full' = q/k/v/o_proj + gate/up/down_proj (current default). "
+            "'attention' = q/k/v/o_proj only (recommended for Stage-2 "
+            "format adapters to avoid MLP-driven behaviour drift)."
+        ),
+    )
+
+    args = parser.parse_args()
+
+    if args.target_module_set == "attention":
+        args.lora_target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
+    elif args.target_module_set == "full":
+        args.lora_target_modules = [
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "gate_proj", "up_proj", "down_proj",
+        ]
+
+    return _apply_train_preset(args)
+
+
+def _apply_train_preset(args: argparse.Namespace) -> argparse.Namespace:
+    if getattr(args, "train_preset", "none") == "none":
+        return args
+
+    if args.train_preset == "fast_pilot":
+        args.include_metamathqa = True
+        args.include_numinamath_cot = True
+        args.include_openmath = True
+        args.include_hendrycks = False
+        args.include_orca_math = True
+        args.include_ultrainteract_math = False
+        args.max_metamathqa_examples = 2000
+        args.max_numinamath_cot_examples = 2000
+        args.max_openmath_examples = 1500
+        args.max_orca_math_examples = 3000
+        args.metamathqa_weight = 1.0
+        args.numinamath_cot_weight = 1.0
+        args.openmath_weight = 1.0
+        args.orca_math_weight = 0.8
+        if args.stage in {"mcq", "mixed_reasoning_mcq"}:
+            args.mcq_bridge_short = True
+        if args.stage in {"mcq", "mixed_reasoning_mcq", "rejection_sft"}:
+            args.max_steps = min(int(args.max_steps), 120)
+        else:
+            args.max_steps = min(int(args.max_steps), 180)
+        print("Applied train preset: fast_pilot")
+        return args
+
+    # one_day_full
+    args.include_metamathqa = True
+    args.include_numinamath_cot = True
+    args.include_openmath = True
+    args.include_hendrycks = True
+    args.include_orca_math = True
+    args.include_ultrainteract_math = True
+    args.max_metamathqa_examples = 8000
+    args.max_numinamath_cot_examples = 8000
+    args.max_openmath_examples = 6000
+    args.max_hendrycks_examples = 5000
+    args.max_orca_math_examples = 30000
+    args.max_ultrainteract_math_examples = 12000
+    args.metamathqa_weight = 1.2
+    args.numinamath_cot_weight = 1.2
+    args.openmath_weight = 1.1
+    args.hendrycks_weight = 1.0
+    args.orca_math_weight = 1.0
+    args.ultrainteract_math_weight = 0.7
+    args.base_replay_weight = 1.1
+    args.rejection_replay_weight = 1.3
+    if args.stage in {"mcq", "mixed_reasoning_mcq"}:
+        args.mcq_bridge_short = True
+    if args.stage in {"mcq", "mixed_reasoning_mcq", "rejection_sft"}:
+        args.max_steps = min(int(args.max_steps), 220)
+    else:
+        args.max_steps = min(int(args.max_steps), 400)
+    print("Applied train preset: one_day_full")
+    return args
+
+
+def resolve_input_path(arg_value: str, root: Path) -> Path:
+    if arg_value == "private":
+        return root / "data" / "private.jsonl"
+    if arg_value == "public":
+        return root / "data" / "public.jsonl"
+
+    path_value = Path(arg_value)
+    return path_value if path_value.is_absolute() else (root / path_value)
+
+
+def split_train_holdout(
+    data: list[dict],
+    *,
+    holdout_fraction: float,
+    seed: int,
+) -> tuple[list[dict], list[dict]]:
+    """Deterministically split supervised items into train vs holdout eval sets."""
+    if not data:
+        return [], []
+    if holdout_fraction <= 0:
+        return data, []
+    if holdout_fraction >= 1:
+        return [], list(data)
+
+    import random as _random
+
+    rng = _random.Random(seed)
+    indices = list(range(len(data)))
+    rng.shuffle(indices)
+    n_holdout = max(1, int(round(len(data) * holdout_fraction)))
+    n_holdout = min(n_holdout, len(data) - 1)
+
+    holdout_set = set(indices[:n_holdout])
+    train = [data[i] for i in range(len(data)) if i not in holdout_set]
+    holdout = [data[i] for i in range(len(data)) if i in holdout_set]
+    return train, holdout
+
+
+def write_jsonl(path: Path, records: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for rec in records:
+            f.write(json.dumps(rec) + "\n")
+
+
+def apply_subset_caps(
+    data: list[dict],
+    *,
+    limit_mcq: int | None,
+    limit_free: int | None,
+    seed: int,
+) -> list[dict]:
+    """Return a deterministic per-type-capped subset of `data`."""
+    if limit_mcq is None and limit_free is None:
+        return data
+
+    import random as _random
+
+    rng = _random.Random(seed)
+
+    mcq_indices = [i for i, item in enumerate(data) if item.get("options")]
+    free_indices = [i for i, item in enumerate(data) if not item.get("options")]
+
+    if limit_mcq is not None and limit_mcq < len(mcq_indices):
+        mcq_pick = sorted(rng.sample(mcq_indices, limit_mcq))
+    else:
+        mcq_pick = mcq_indices
+
+    if limit_free is not None and limit_free < len(free_indices):
+        free_pick = sorted(rng.sample(free_indices, limit_free))
+    else:
+        free_pick = free_indices
+
+    keep = sorted(set(mcq_pick) | set(free_pick))
+    selected = [data[i] for i in keep]
+
+    print(
+        f"Subset: {len(mcq_pick)}/{len(mcq_indices)} MCQ + "
+        f"{len(free_pick)}/{len(free_indices)} free-form "
+        f"(seed={seed}) -> {len(selected)} items"
+    )
+    return selected
+
+
+def build_run_stem(input_stem: str, args: argparse.Namespace) -> str:
+    """Append a deterministic suffix when subset caps are active."""
+    parts: list[str] = []
+    if args.limit_mcq is not None:
+        parts.append(f"mcq{args.limit_mcq}")
+    if args.limit_free is not None:
+        parts.append(f"free{args.limit_free}")
+    if not parts:
+        return input_stem
+    parts.append(f"seed{args.sample_seed}")
+    return f"{input_stem}_{'_'.join(parts)}"

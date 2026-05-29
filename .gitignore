@@ -1,6 +1,9 @@
-.claude
-.venv
-results
-data
-__pycache__
-LICENSE
+.venv/
+.ipynb_checkpoints/
+__pycache__/
+
+data/
+artifacts/
+results/
+
+*.pyc
