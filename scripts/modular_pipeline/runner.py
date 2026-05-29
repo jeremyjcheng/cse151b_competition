@@ -9,9 +9,14 @@ from pathlib import Path
 from tqdm import tqdm
 
 from cli_utils import apply_subset_caps, build_run_stem, parse_args, resolve_input_path
-from evaluation import evaluate_with_judger
 from model_pipeline import ModularPipeline
-from settings import FREE_BATCH_SIZE, MCQ_BATCH_SIZE
+from settings import (
+    FREE_BATCH_SIZE,
+    MAX_TOKENS_FREE,
+    MAX_TOKENS_MCQ,
+    MAX_TOKENS_MCQ_FINAL,
+    MCQ_BATCH_SIZE,
+)
 
 
 def _discover_project_root(start: Path) -> Path:
@@ -191,23 +196,37 @@ def _write_private_submission_sorted_csv(
     _verify_private_submission_rows(rows, expected_ids=expected_ids)
 
 
-def main() -> None:
-    args = parse_args()
-
-    here = Path(__file__).resolve().parent
-    root = _discover_project_root(here)
-
-    if str(root) not in sys.path:
-        sys.path.insert(0, str(root))
-
-    input_path = resolve_input_path(args.input, root)
-    if not input_path.exists():
-        raise SystemExit(f"Input file not found: {input_path}")
-
-    output_dir = Path(args.output_dir) if args.output_dir else root / "results"
+def run_pipeline(
+    *,
+    input_path: Path,
+    output_dir: Path,
+    gpu_id: str = "0",
+    lora_adapter_path: str | None = None,
+    vllm_quantization: str | None = None,
+    vllm_load_format: str | None = None,
+    vllm_enforce_eager: bool | None = None,
+    inference_backend: str = "vllm",
+    mcq_max_new_tokens: int | None = None,
+    mcq_final_max_new_tokens: int | None = None,
+    free_max_new_tokens: int | None = None,
+    limit_mcq: int | None = None,
+    limit_free: int | None = None,
+    sample_seed: int = 0,
+    no_eval: bool = False,
+    save_raw_output: bool = True,
+    submission_full_trace: bool = False,
+    run_stem: str | None = None,
+) -> Path:
+    """Run inference on a JSONL dataset and write the submission CSV."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    stem = build_run_stem(input_path.stem, args)
+    mcq_max_new_tokens = MAX_TOKENS_MCQ if mcq_max_new_tokens is None else mcq_max_new_tokens
+    mcq_final_max_new_tokens = (
+        MAX_TOKENS_MCQ_FINAL if mcq_final_max_new_tokens is None else mcq_final_max_new_tokens
+    )
+    free_max_new_tokens = MAX_TOKENS_FREE if free_max_new_tokens is None else free_max_new_tokens
+
+    stem = run_stem or input_path.stem
     output_path = output_dir / f"{stem}_outputs.jsonl"
     ordered_output_path = output_dir / f"{stem}_outputs_ordered.jsonl"
     submission_path = output_dir / f"{stem}_submission.csv"
@@ -220,9 +239,9 @@ def main() -> None:
 
     data = apply_subset_caps(
         data,
-        limit_mcq=args.limit_mcq,
-        limit_free=args.limit_free,
-        seed=args.sample_seed,
+        limit_mcq=limit_mcq,
+        limit_free=limit_free,
+        seed=sample_seed,
     )
 
     done_ids = _load_done_ids(output_path)
@@ -233,15 +252,15 @@ def main() -> None:
 
     if remaining_data:
         pipe = ModularPipeline(
-            gpu_id=args.gpu_id,
-            lora_adapter_path=args.lora_adapter_path,
-            vllm_quantization=args.vllm_quantization,
-            vllm_load_format=args.vllm_load_format,
-            enforce_eager=True if args.vllm_enforce_eager else None,
-            inference_backend=args.inference_backend,
-            mcq_max_new_tokens=args.mcq_max_new_tokens,
-            mcq_final_max_new_tokens=args.mcq_final_max_new_tokens,
-            free_max_new_tokens=args.free_max_new_tokens,
+            gpu_id=gpu_id,
+            lora_adapter_path=lora_adapter_path,
+            vllm_quantization=vllm_quantization,
+            vllm_load_format=vllm_load_format,
+            enforce_eager=vllm_enforce_eager,
+            inference_backend=inference_backend,
+            mcq_max_new_tokens=mcq_max_new_tokens,
+            mcq_final_max_new_tokens=mcq_final_max_new_tokens,
+            free_max_new_tokens=free_max_new_tokens,
         )
         mcq_items = [item for item in remaining_data if item.get("options")]
         free_items = [item for item in remaining_data if not item.get("options")]
@@ -257,7 +276,7 @@ def main() -> None:
                     f,
                     chunk,
                     solved_batch,
-                    save_raw_output=args.save_raw_output,
+                    save_raw_output=save_raw_output,
                 )
 
             for start in tqdm(range(0, len(free_items), FREE_BATCH_SIZE), desc="Solving free-form batches"):
@@ -267,7 +286,7 @@ def main() -> None:
                     f,
                     chunk,
                     solved_batch,
-                    save_raw_output=args.save_raw_output,
+                    save_raw_output=save_raw_output,
                 )
 
         print(f"Saved incremental outputs to {output_path.resolve()}")
@@ -288,7 +307,7 @@ def main() -> None:
             f.write(json.dumps(rec) + "\n")
     print(f"Saved ordered outputs to {ordered_output_path.resolve()}")
 
-    is_private_input = input_path.stem == "private"
+    is_private_input = input_path.stem == "private" or stem == "private"
     if is_private_input:
         _write_private_submission_sorted_csv(
             output_path=submission_path,
@@ -302,7 +321,7 @@ def main() -> None:
             short_trace_count = 0
             for item in data:
                 rec = records_by_id[item.get("id")]
-                if args.submission_full_trace:
+                if submission_full_trace:
                     meta = rec.get("meta") or {}
                     trace = rec.get("raw") or meta.get("raw") or rec.get("response", "")
                     n_tok = meta.get("n_tokens") or meta.get("total_n_tokens")
@@ -312,7 +331,7 @@ def main() -> None:
                     trace = rec.get("response", "")
                 response = str(trace).replace("\r\n", "\n").replace("\r", "\n")
                 writer.writerow([rec["id"], response])
-            if args.submission_full_trace:
+            if submission_full_trace:
                 print(
                     "Submission CSV uses full model traces (--submission-full-trace)."
                 )
@@ -324,5 +343,50 @@ def main() -> None:
                     )
         print(f"Saved submission CSV to {submission_path.resolve()}")
 
-    if has_answers and not args.no_eval:
+    if has_answers and not no_eval:
+        from evaluation import evaluate_with_judger
+
         evaluate_with_judger(data, records_by_id)
+
+    return submission_path
+
+
+def main() -> None:
+    args = parse_args()
+
+    here = Path(__file__).resolve().parent
+    root = _discover_project_root(here)
+
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+
+    input_path = resolve_input_path(args.input, root)
+    if not input_path.exists():
+        raise SystemExit(f"Input file not found: {input_path}")
+
+    output_dir = Path(args.output_dir) if args.output_dir else root / "results"
+
+    run_pipeline(
+        input_path=input_path,
+        output_dir=output_dir,
+        gpu_id=args.gpu_id,
+        lora_adapter_path=args.lora_adapter_path,
+        vllm_quantization=args.vllm_quantization,
+        vllm_load_format=args.vllm_load_format,
+        vllm_enforce_eager=True if args.vllm_enforce_eager else None,
+        inference_backend=args.inference_backend,
+        mcq_max_new_tokens=args.mcq_max_new_tokens,
+        mcq_final_max_new_tokens=args.mcq_final_max_new_tokens,
+        free_max_new_tokens=args.free_max_new_tokens,
+        limit_mcq=args.limit_mcq,
+        limit_free=args.limit_free,
+        sample_seed=args.sample_seed,
+        no_eval=args.no_eval,
+        save_raw_output=args.save_raw_output,
+        submission_full_trace=args.submission_full_trace,
+        run_stem=build_run_stem(input_path.stem, args),
+    )
+
+
+if __name__ == "__main__":
+    main()
