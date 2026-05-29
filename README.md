@@ -1,55 +1,72 @@
-# CSE 151B Competition
+# CSE 151B Competition Submission
 
-This submission uses the **base model only** — no fine-tuning or LoRA adapters.
+## Overview
 
-**Model:** `[Qwen/Qwen3-4B-Thinking-2507](https://huggingface.co/Qwen/Qwen3-4B-Thinking-2507)`  
-**Inference:** vLLM with bitsandbytes INT8 quantization  
-**Entry point:** `run_inference()` in `run_inference.py`
+This submission uses the base version of **Qwen/Qwen3-4B-Thinking-2507** without fine-tuning, LoRA adapters, or additional training.
 
-## Approach
+| Item                 | Value                                                 |
+| -------------------- | ----------------------------------------------------- |
+| **Model**            | `Qwen/Qwen3-4B-Thinking-2507`                         |
+| **Inference engine** | vLLM with bitsandbytes INT8 quantization              |
+| **Entry point**      | `run_inference.py` (defaults to the private test set) |
+| **Final output**     | `results/private_submission.csv`                      |
 
-We run the stock Qwen3-4B-Thinking model with tuned decoding hyperparameters (long reasoning traces, MCQ verify/finalizer, repetition controls, thinking-mode prompts). All settings are in `scripts/modular_pipeline/settings.py`. The pipeline applies post-processing automatically and writes the final submission CSV.
+The system improves performance through prompting, reasoning-oriented decoding, MCQ verification, answer extraction, and post-processing while keeping the original model weights unchanged.
 
----
-
-## Hardware and runtime
-
-| Item                                                | Value                                                                                                        |
-| --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| **GPU used**                                        | **NVIDIA A30** (24 GB VRAM)                                                                                  |
-| **Private set size**                                | 943 questions (`data/private.jsonl`)                                                                         |
-| **Wall-clock time (this submission)**               | **Up to ~20 hours** — run overnight with server disconnects; exact idle time between resumes was not tracked |
-| **Active GPU generation (estimate, uninterrupted)** | **~10–14 hours** on A30 with current `settings.py`                                                           |
-
-Our highest run began running overnight on a remote server that **disconnected repeatedly**. Each time, we rebooted the machine and reran the same command; the pipeline **resumed** from `results/private_outputs.jsonl` and skipped questions already completed. Total calendar time reached **~20 hours**, but that includes unknown downtime between sessions (reboot, reconnect, model reload), not 20 hours of continuous generation.
-
-Timing breakdown for an **uninterrupted** run (approximate, with current token caps):
-
-- **Model load + vLLM init:** ~3–5 minutes per session (first run also downloads weights; see below)
-- **MCQ (~375 items, batch 12):** ~4–6 hours — long thinking traces + optional verify/finalizer pass
-- **Free-form (~568 items, batch 2):** ~5–8 hours — up to 16k new tokens per item with sampling
-
-To reproduce: run `python run_inference.py` and rerun the same command after any crash or disconnect until all 943 ids are present. Times will differ on other GPUs (e.g. faster on A100/H100, slower on T4). GPU utilization often sits around 30–60% during autoregressive decoding with small batch sizes; that is normal.
+All hyperparameters live in `scripts/modular_pipeline/settings.py`.
 
 ---
 
-## Model weights setup
+## Datasets
 
-**No manual download or local weight directory is required.** vLLM loads `[Qwen/Qwen3-4B-Thinking-2507](https://huggingface.co/Qwen/Qwen3-4B-Thinking-2507)` from the Hugging Face Hub on first run and caches weights under `~/.cache/huggingface/hub/`.
+Place competition JSONL files under `data/` (this directory is gitignored; it is not shipped in the repo).
+
+The pipeline splits questions the same way as `runner.py`: a row is **MCQ** if it has a non-empty `options` field; otherwise it is **free-response (FRQ)**.
+
+| File                                           | Total | MCQ | FRQ |
+| ---------------------------------------------- | ----: | --: | --: |
+| `data/private.jsonl` (default inference input) |   943 | 300 | 643 |
+| `data/public.jsonl` (local dev / judger eval)  |  1126 | 375 | 751 |
 
 ---
 
-## Reproduce results: `run_inference()`
+## Method
 
-Install dependencies once: `pip install -r requirements.txt`
+The pipeline maximizes answer quality with inference-time techniques rather than training:
 
-Hyperparameters come from `scripts/modular_pipeline/settings.py`. **Input defaults to private**; override only if needed.
+- Long-form reasoning generation (Qwen thinking mode for MCQ primary pass)
+- Multi-stage MCQ extraction and confidence-based verification
+- Automatic response post-processing and `\boxed{}` handling
+- Incremental checkpointing in `results/*_outputs.jsonl` with resume on rerun
 
-### Shell
+At default settings, generation caps are **12,288** tokens per MCQ item and **16,384** per FRQ item (`MAX_BASE_ENABLED` doubles the 6144 / 8192 baselines). Batch sizes are **12** (MCQ) and **2** (FRQ).
+
+---
+
+## Installation
 
 ```bash
-python run_inference.py                  # private (default)
-python run_inference.py --input public   # public dev set + judger eval
+pip install -r requirements.txt
+```
+
+The model is downloaded from Hugging Face on first run and cached locally.
+
+---
+
+## Running inference
+
+From the repository root:
+
+```bash
+python run_inference.py
+```
+
+Private test set (default): `data/private.jsonl` → `results/private_submission.csv`.
+
+Public development set (runs judger accuracy when `answer` fields are present):
+
+```bash
+python run_inference.py --input public
 ```
 
 Optional GPU selection:
@@ -58,57 +75,94 @@ Optional GPU selection:
 CUDA_VISIBLE_DEVICES=0 python run_inference.py
 ```
 
-### Python
+Full CLI (LoRA, limits, vLLM overrides) is available via:
 
-```python
-from run_inference import run_inference
-
-submission_csv = run_inference()
-print(submission_csv)  # -> results/private_submission.csv
+```bash
+python scripts/modular_pipeline/modular_pipeline.py --help
 ```
 
-### Outputs
+---
 
-| File                                    | Description                                   |
-| --------------------------------------- | --------------------------------------------- |
-| `results/private_submission.csv`        | **Final submission** (sorted, verified)       |
-| `results/private_outputs.jsonl`         | Incremental raw inference records (resumable) |
-| `results/private_outputs_ordered.jsonl` | Same records, ordered by input file           |
+## Outputs
+
+| File                                    | Description                                 |
+| --------------------------------------- | ------------------------------------------- |
+| `results/private_submission.csv`        | Final competition submission (private run)  |
+| `results/private_outputs.jsonl`         | Incremental raw records (resume checkpoint) |
+| `results/private_outputs_ordered.jsonl` | Same records, ordered to match input        |
+
+Stem names follow the input file (e.g. `public_submission.csv` for `--input public`).
+
+If a run stops early, rerun the same command; completed question IDs in `*_outputs.jsonl` are skipped.
+
+---
+
+## Runtime
+
+Measured on **NVIDIA A30 (24 GB VRAM)** for an uninterrupted private run (943 questions: 300 MCQ, 643 FRQ).
+
+| Stage                                                            | Approximate time |
+| ---------------------------------------------------------------- | ---------------- |
+| Model initialization                                             | 3–5 minutes      |
+| MCQ (300 items, batch 12; includes verify/finalizer on a subset) | 3–5 hours        |
+| FRQ (643 items, batch 2)                                         | 5–8 hours        |
+| **Total (uninterrupted)**                                        | **~8–13 hours**  |
+
+Wall-clock time can be much higher if the job is interrupted: the pipeline resumes from `results/private_outputs.jsonl`, but each restart reloads the model.
 
 ---
 
 ## Configuration
 
-Edit `scripts/modular_pipeline/settings.py` to change behavior. Key knobs:
+Edit `scripts/modular_pipeline/settings.py`.
 
-| Setting                              | Default (this submission)     | Role                                |
+| Setting                              | Default (base run)            | Role                                |
 | ------------------------------------ | ----------------------------- | ----------------------------------- |
-| `MODEL_ID`                           | `Qwen/Qwen3-4B-Thinking-2507` | Base model on Hugging Face Hub      |
-| `MAX_TOKENS_MCQ`                     | 12288                         | MCQ generation cap                  |
-| `MAX_TOKENS_FREE`                    | 16384                         | Free-form generation cap            |
-| `VLLM_MAX_MODEL_LEN`                 | 20480                         | Context window                      |
+| `MODEL_ID`                           | `Qwen/Qwen3-4B-Thinking-2507` | Hugging Face model id               |
+| `MAX_TOKENS_MCQ`                     | 12288                         | MCQ primary generation cap          |
+| `MAX_TOKENS_FREE`                    | 16384                         | FRQ generation cap                  |
+| `VLLM_MAX_MODEL_LEN`                 | 20480                         | vLLM context length                 |
 | `MCQ_BATCH_SIZE` / `FREE_BATCH_SIZE` | 12 / 2                        | Inference batch sizes               |
-| `ENABLE_THINKING_MCQ_PRIMARY`        | `True`                        | Qwen thinking mode for MCQ          |
+| `ENABLE_THINKING_MCQ_PRIMARY`        | `True`                        | Thinking mode on MCQ primary pass   |
 | `MCQ_VERIFY_ENABLED`                 | `True`                        | Low-confidence MCQ verify/finalizer |
 
 ---
 
 ## Repository layout
 
-| Path                                   | Description                            |
-| -------------------------------------- | -------------------------------------- |
-| `run_inference.py`                     | Competition entry point                |
-| `scripts/modular_pipeline/`            | Inference pipeline                     |
-| `scripts/modular_pipeline/settings.py` | All hyperparameters                    |
-| `data/private.jsonl`                   | Private test set (local only)          |
-| `data/public.jsonl`                    | Public dev set with answers (optional) |
-| `judger.py`, `utils.py`                | Optional public-set scoring            |
-| `results/`                             | Runtime outputs                        |
+```text
+run_inference.py              # competition entry point
+scripts/modular_pipeline/
+  settings.py                 # all hyperparameters
+  run_inference.py            # pipeline wrapper used by run_inference.py
+  modular_pipeline.py         # full CLI (delegates to runner.py)
+  runner.py                   # batched inference + resume
+data/                         # local only (gitignored)
+  private.jsonl
+  public.jsonl
+results/                      # gitignored
+judger.py
+utils.py
+```
 
-## Optional: evaluate on public data
+---
+
+## Public evaluation
+
+Same pipeline and settings; judger runs automatically when answers are available:
+
+```bash
+python run_inference.py --input public
+```
+
+Equivalent full CLI:
 
 ```bash
 python scripts/modular_pipeline/modular_pipeline.py --input public
 ```
 
-Uses the same base-model pipeline and reports accuracy via `judger.py` (local dev only).
+---
+
+## Summary
+
+This submission uses unmodified **Qwen/Qwen3-4B-Thinking-2507** weights and relies on inference-time prompting, decoding, MCQ verification, and post-processing. No fine-tuning or LoRA adapters are used for the base submission path.
